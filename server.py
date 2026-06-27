@@ -254,81 +254,117 @@ async def health(request: Request) -> PlainTextResponse:
 # --- Orders -------------------------------------------------------------------
 
 @mcp.tool()
-def get_orders(days_ago: int = 7, status: str = "Unshipped,PartiallyShipped,Shipped") -> dict:
-    """Get orders from the last N days. Status can be comma-separated list."""
-    created_after = _iso(datetime.now(timezone.utc) - timedelta(days=days_ago))
-    try:
-        res = Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_orders(
-            CreatedAfter=created_after,
-            OrderStatuses=status.split(","),
-        )
-        return res.payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+@tool_safe
+def get_orders(days_ago: int = 7, created_after: str = None, created_before: str = None,
+               status: str = "Unshipped,PartiallyShipped,Shipped",
+               fulfillment_channels: str = None, max_orders: int = 200,
+               next_token: str = None, fields: str = None) -> dict:
+    """Get orders for the last N days OR an explicit IST date range
+    (created_after/created_before, ISO date or datetime). status is a comma list,
+    or "all" to omit the filter. fulfillment_channels filters AFN/MFN. Paginated up
+    to ~max_orders (page-aligned, ~100/page); pass back next_token to resume. fields
+    is a comma-separated projection (e.g. "AmazonOrderId,OrderStatus,OrderTotal,
+    PurchaseDate") to shrink the response. PurchaseDate values are UTC."""
+    ca, cb = _window(days_ago, created_after, created_before)
+    statuses = None if status.strip().lower() == "all" else [s.strip() for s in status.split(",") if s.strip()]
+    channels = [c.strip() for c in fulfillment_channels.split(",") if c.strip()] if fulfillment_channels else None
+
+    def call(token):
+        cursor = token or next_token  # resume from a caller-supplied next_token on page 1
+        if cursor:
+            kwargs = {"NextToken": cursor}  # Amazon rejects a token combined with other filters
+        else:
+            kwargs = {"CreatedAfter": ca, "CreatedBefore": cb, "MarketplaceIds": [MARKETPLACE]}
+            if statuses:
+                kwargs["OrderStatuses"] = statuses
+            if channels:
+                kwargs["FulfillmentChannels"] = channels
+        return Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_orders(**kwargs).payload
+
+    orders, truncated, tok = _paginate(call, "Orders", lambda p: p.get("NextToken"), max_items=max_orders)
+    orders = _project(orders, fields)
+    return {"orders": orders, "count": len(orders), "truncated": truncated, "next_token": tok}
 
 
 @mcp.tool()
+@tool_safe
 def get_order(order_id: str) -> dict:
     """Get full details for a specific order ID."""
-    try:
-        return Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order(order_id).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+    return Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order(order_id).payload
 
 
 @mcp.tool()
-def get_order_items(order_id: str) -> dict:
-    """Get line items for a specific order."""
-    try:
-        return Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order_items(order_id).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+@tool_safe
+def get_order_items(order_id: str, max_items: int = 500, fields: str = None) -> dict:
+    """Get line items for a specific order (paginated for large orders)."""
+    def call(token):
+        kwargs = {"NextToken": token} if token else {}
+        return Orders(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order_items(order_id, **kwargs).payload
+    items, truncated, tok = _paginate(call, "OrderItems", lambda p: p.get("NextToken"), max_items=max_items)
+    items = _project(items, fields)
+    return {"order_id": order_id, "items": items, "count": len(items), "truncated": truncated, "next_token": tok}
 
 
 # --- Inventory (FBA) ----------------------------------------------------------
 
 @mcp.tool()
-def get_inventory_summary(seller_sku: str = None) -> dict:
-    """
-    Get FBA inventory summary. Optionally filter by seller SKU.
-    Returns quantities: fulfillable, inbound, reserved, unfulfillable.
-    """
-    try:
-        kwargs = dict(details=True, granularityType="Marketplace", granularityId=MARKETPLACE)
-        if seller_sku:
-            kwargs["sellerSkus"] = [seller_sku]
+@tool_safe
+def get_inventory_summary(seller_skus: str = None, details: bool = True,
+                          max_items: int = 500, fields: str = None,
+                          next_token: str = None) -> dict:
+    """Get FBA inventory summary across all SKUs (paginated). details=True (default)
+    includes the fulfillable/inbound/reserved/unfulfillable breakdown; set
+    details=False for a lighter list. seller_skus is an optional comma list. fields
+    is a comma-separated projection (e.g. "sellerSku,asin,totalQuantity"); pass
+    next_token to resume. Paginated up to ~max_items."""
+    skus = [s.strip() for s in seller_skus.split(",") if s.strip()] if seller_skus else None
+
+    def call(token):
+        # FBA Inventory requires the SAME params on every page plus startDateTime to
+        # emit a pagination token at all; a far-past start filters nothing out.
+        kwargs = {"details": details, "granularityType": "Marketplace",
+                  "granularityId": MARKETPLACE, "marketplaceIds": [MARKETPLACE],
+                  "startDateTime": "2015-01-01T00:00:00Z"}
+        if skus:
+            kwargs["sellerSkus"] = skus
+        cursor = token or next_token
+        if cursor:
+            kwargs["nextToken"] = cursor
         return Inventories(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_inventory_summary_marketplace(**kwargs).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+
+    items, truncated, tok = _paginate(
+        call, "inventorySummaries",
+        lambda p: (p.get("pagination") or {}).get("nextToken"), max_items=max_items)
+    items = _project(items, fields)
+    return {"inventory": items, "count": len(items), "truncated": truncated, "next_token": tok}
 
 
 # --- Sales metrics ------------------------------------------------------------
 
 @mcp.tool()
-def get_sales_metrics(days_ago: int = 30, granularity: str = "Day") -> dict:
-    """
-    Get sales aggregates. granularity = Day | Week | Month.
-    Returns ordered units, order count, average selling price, average units per order.
-    """
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days_ago)
+@tool_safe
+def get_sales_metrics(days_ago: int = 30, granularity: str = "Day",
+                      created_after: str = None, created_before: str = None) -> dict:
+    """Get sales aggregates bucketed by granularity (Day | Week | Month | ...).
+    Window is the last N days OR an explicit IST date range; it is floored to IST
+    midnight so buckets are whole days (no ragged partial edges). Returns ordered
+    units, order count, average selling price, average units per order."""
     try:
         gran = Granularity[granularity.upper()]
     except KeyError:
         valid = ", ".join(g.name.title() for g in Granularity)
-        return {"error": f"Invalid granularity {granularity!r}; use one of: {valid}"}
-    try:
-        res = Sales(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order_metrics(
-            interval=(_iso(start), _iso(end)),
-            granularity=gran,
-            granularityTimeZone="Asia/Kolkata",
-            marketplaceIds=[MARKETPLACE],
-        )
-        # get_order_metrics returns a JSON array; MCP structured output needs a
-        # top-level object, so wrap the list under a key.
-        return {"metrics": res.payload}
-    except SellingApiException as e:
-        return {"error": str(e)}
+        return {"error": {"type": "ValueError",
+                          "message": f"Invalid granularity {granularity!r}; use one of: {valid}"}}
+    start, end = _window(days_ago, created_after, created_before, floor_to_day=True)
+    res = Sales(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_order_metrics(
+        interval=(start, end),
+        granularity=gran,
+        granularityTimeZone="Asia/Kolkata",
+        marketplaceIds=[MARKETPLACE],
+    )
+    # get_order_metrics returns a JSON array; MCP structured output needs a
+    # top-level object, so wrap the list under a key.
+    return {"metrics": res.payload}
 
 
 # --- Reports (async — request → poll → download) ------------------------------
@@ -411,88 +447,120 @@ def _latest_settlement_report(max_rows=500, fields=None):
     return result
 
 
-@mcp.tool()
-def get_fba_reimbursements(days_ago: int = 60) -> dict:
-    """Get FBA reimbursements for lost or damaged inventory in the last N days."""
-    return _request_and_fetch_report("GET_FBA_REIMBURSEMENTS_DATA", days_ago)
-
-
-@mcp.tool()
-def get_settlement_report(days_ago: int = 30) -> dict:
-    """Get settlement/disbursement report showing payment breakdown."""
-    return _request_and_fetch_report("GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE", days_ago)
-
+# Report tools return a bounded envelope: TSV reports → {rows, truncated, content}
+# capped at max_rows with optional column projection via fields; the JSON report
+# (sales & traffic) → {content: <object>}. Long reports can exceed the MCP gateway
+# timeout — when that happens the tool returns {status:"IN_PROGRESS", reportId}; the
+# report keeps generating server-side, so re-call the same tool with report_id=<id>
+# to fetch it once ready.
 
 @mcp.tool()
-def get_fba_storage_fees(days_ago: int = 30) -> dict:
-    """Get FBA monthly storage fee charges by SKU/ASIN."""
-    return _request_and_fetch_report("GET_FBA_STORAGE_FEE_CHARGES_DATA", days_ago)
+@tool_safe
+def get_fba_reimbursements(days_ago: int = 60, after: str = None, before: str = None,
+                           max_rows: int = 500, fields: str = None, report_id: str = None) -> dict:
+    """Get FBA reimbursements for lost or damaged inventory (last N days or IST range)."""
+    return _request_and_fetch_report("GET_FBA_REIMBURSEMENTS_DATA", days_ago, after, before,
+                                     max_rows=max_rows, fields=fields, report_id=report_id)
 
 
 @mcp.tool()
-def get_fba_long_term_storage_fees() -> dict:
+@tool_safe
+def get_settlement_report(max_rows: int = 500, fields: str = None) -> dict:
+    """Get the most recent settlement/disbursement report. Settlement reports are
+    scheduled by Amazon (not requestable on demand), so this returns the latest
+    available one. fields projects TSV columns; max_rows caps rows."""
+    return _latest_settlement_report(max_rows=max_rows, fields=fields)
+
+
+@mcp.tool()
+@tool_safe
+def get_fba_storage_fees(days_ago: int = 30, after: str = None, before: str = None,
+                         max_rows: int = 500, fields: str = None, report_id: str = None) -> dict:
+    """Get FBA monthly storage fee charges by SKU/ASIN (last N days or IST range)."""
+    return _request_and_fetch_report("GET_FBA_STORAGE_FEE_CHARGES_DATA", days_ago, after, before,
+                                     max_rows=max_rows, fields=fields, report_id=report_id)
+
+
+@mcp.tool()
+@tool_safe
+def get_fba_long_term_storage_fees(max_rows: int = 500, fields: str = None,
+                                   report_id: str = None) -> dict:
     """Get FBA long-term storage fees (inventory aged 180+ and 365+ days)."""
-    return _request_and_fetch_report("GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA", days_ago=180)
+    return _request_and_fetch_report("GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+                                     days_ago=180, max_rows=max_rows, fields=fields, report_id=report_id)
 
 
 @mcp.tool()
-def get_inventory_ledger(days_ago: int = 30) -> dict:
-    """Get inventory ledger report — tracks all inventory movements (receipts, shipments, removals, adjustments)."""
-    return _request_and_fetch_report("GET_LEDGER_SUMMARY_VIEW_DATA", days_ago)
+@tool_safe
+def get_inventory_ledger(days_ago: int = 30, after: str = None, before: str = None,
+                         max_rows: int = 500, fields: str = None, report_id: str = None) -> dict:
+    """Get inventory ledger report — all inventory movements (receipts, shipments,
+    removals, adjustments) for the last N days or an IST date range."""
+    return _request_and_fetch_report("GET_LEDGER_SUMMARY_VIEW_DATA", days_ago, after, before,
+                                     max_rows=max_rows, fields=fields, report_id=report_id)
 
 
 @mcp.tool()
-def get_sales_traffic_report(days_ago: int = 30) -> dict:
-    """Get sales & traffic report — sessions, page views, buy box %, conversion rate by ASIN."""
-    return _request_and_fetch_report("GET_SALES_AND_TRAFFIC_REPORT", days_ago)
+@tool_safe
+def get_sales_traffic_report(days_ago: int = 30, after: str = None, before: str = None,
+                             report_id: str = None) -> dict:
+    """Get sales & traffic report — sessions, page views, buy box %, conversion rate
+    by ASIN (JSON document) for the last N days or an IST date range."""
+    return _request_and_fetch_report("GET_SALES_AND_TRAFFIC_REPORT", days_ago, after, before,
+                                     report_id=report_id)
 
 
 # --- Fee estimates ------------------------------------------------------------
 
 @mcp.tool()
-def get_fee_estimate(asin: str, price: float) -> dict:
-    """
-    Get FBA fee estimate for an ASIN at a given selling price (INR).
-    Returns referral fee, FBA fulfillment fee, total estimated fees.
-    """
-    try:
-        return ProductFees(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_product_fees_estimate_for_asin(
-            asin, price, currency="INR", is_fba=True
-        ).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+@tool_safe
+def get_fee_estimate(asin: str, price: float, is_fba: bool = True,
+                     currency: str = "INR") -> dict:
+    """Get a fee estimate for an ASIN at a given selling price.
+    Returns referral fee, fulfillment fee (FBA when is_fba), total estimated fees."""
+    return ProductFees(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_product_fees_estimate_for_asin(
+        asin, price, currency=currency, is_fba=is_fba
+    ).payload
 
 
 # --- Catalog / listings -------------------------------------------------------
 
 @mcp.tool()
-def get_catalog_item(asin: str) -> dict:
-    """Get product details for an ASIN — title, brand, dimensions, images."""
-    try:
-        # The library's CatalogItems uses API version 2020-12-01, where valid
-        # includedData excludes "dimensions" (a 2022-04-01 field). Dimension
-        # data is returned within "attributes" instead.
-        return CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_catalog_item(
-            asin=asin,
-            marketplaceIds=[MARKETPLACE],
-            includedData=["attributes", "summaries", "images"],
-        ).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+@tool_safe
+def get_catalog_item(asin: str, included_data: str = "attributes,summaries,images",
+                     fields: str = None) -> dict:
+    """Get product details for an ASIN — title, brand, dimensions, images.
+    included_data is a comma list (the library's CatalogItems uses API 2020-12-01,
+    where dimensions live inside "attributes"). fields projects top-level keys of
+    the response to trim the (heavy) attributes block."""
+    payload = CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_catalog_item(
+        asin=asin,
+        marketplaceIds=[MARKETPLACE],
+        includedData=[s.strip() for s in included_data.split(",") if s.strip()],
+    ).payload
+    if fields:
+        keys = [f.strip() for f in fields.split(",") if f.strip()]
+        return {k: payload[k] for k in keys if k in payload}
+    return payload
 
 
 @mcp.tool()
-def search_catalog(keywords: str, page_size: int = 10) -> dict:
-    """Search catalog by keywords. Returns ASINs, titles, and basic product info."""
-    try:
-        return CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).search_catalog_items(
-            keywords=keywords,
-            marketplaceIds=[MARKETPLACE],
-            includedData=["summaries"],
-            pageSize=page_size,
-        ).payload
-    except SellingApiException as e:
-        return {"error": str(e)}
+@tool_safe
+def search_catalog(keywords: str, page_size: int = 10, page_token: str = None,
+                   included_data: str = "summaries") -> dict:
+    """Search catalog by keywords. Returns ASINs, titles, and basic product info.
+    Pass page_token (from a previous response's next_token) to page; when paging,
+    keywords/page_size are ignored by Amazon. included_data is a comma list."""
+    included = [s.strip() for s in included_data.split(",") if s.strip()]
+    if page_token:
+        kwargs = {"marketplaceIds": [MARKETPLACE], "includedData": included,
+                  "pageToken": page_token}
+    else:
+        kwargs = {"keywords": keywords, "marketplaceIds": [MARKETPLACE],
+                  "includedData": included, "pageSize": page_size}
+    payload = CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).search_catalog_items(**kwargs).payload
+    payload["next_token"] = (payload.get("pagination") or {}).get("nextToken")
+    return payload
 
 
 # --- Entrypoint ---------------------------------------------------------------
