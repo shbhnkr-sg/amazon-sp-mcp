@@ -25,7 +25,33 @@ Both **Claude Code** and **Codex** connect to the same URL, from any device
 | Catalog | `get_catalog_item`, `search_catalog` |
 
 Report-backed tools (settlement, reimbursements, storage fees, ledger, traffic)
-use the SP-API async Reports flow: request → poll up to 120s → download.
+use the SP-API async Reports flow: request → poll → download.
+
+## Response conventions
+
+All tools are bounded and consistent so responses stay within an agent's token budget:
+
+- **List tools** (`get_orders`, `get_inventory_summary`, `get_order_items`) return
+  `{ "<items>": [...], "count", "truncated", "next_token" }`. They paginate
+  automatically up to a cap (`max_orders` / `max_items`, ~page-aligned). If
+  `truncated` is true, pass `next_token` back in to fetch the next slice.
+- **Field projection:** pass `fields="a,b,c"` (comma-separated top-level keys) to
+  any list/catalog tool to trim the payload — e.g.
+  `get_orders(fields="AmazonOrderId,OrderStatus,OrderTotal,PurchaseDate")`.
+- **Time windows:** `get_orders`, `get_sales_metrics`, and report tools accept
+  either `days_ago` (last N days) or an explicit IST range via
+  `created_after`/`created_before` (orders/sales) or `after`/`before` (reports),
+  as ISO dates/datetimes interpreted in **IST**. Order `PurchaseDate` values are
+  UTC. Sales windows are floored to IST midnight so day buckets are whole days.
+- **Report tools** return `{reportId, rows, truncated, content}` for TSV reports
+  (with `max_rows` cap + `fields` column projection) or `{content: <json>}` for the
+  sales & traffic report. A report that outlives the gateway timeout returns
+  `{status: "IN_PROGRESS", reportId}` — re-call the same tool with `report_id=<id>`
+  to fetch it once ready. `get_settlement_report` returns the **latest scheduled**
+  settlement report (Amazon generates these; they can't be requested on demand).
+- **Errors** are always `{ "error": { "type", "code", "message" } }` — never a raw
+  500 — so a throttle, bad input, or not-found is distinguishable.
+- **Throttling:** every SP-API call retries 429/5xx with exponential backoff.
 
 ## Credentials
 
