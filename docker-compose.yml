@@ -1,0 +1,23 @@
+services:
+  amazon-sp-mcp:
+    build: .
+    image: amazon-sp-mcp:latest
+    container_name: amazon-sp-mcp
+    restart: unless-stopped
+    # Exposed on all host interfaces so other LAN devices can connect.
+    # NOTE: the server has no auth — anyone who can reach this port can read
+    # your Amazon seller data. Keep this host on a trusted network only.
+    ports:
+      - "3100:3000"
+    env_file:
+      - .env
+    environment:
+      LWA_CLIENT_ID: ${LWA_CLIENT_ID:?missing LWA_CLIENT_ID}
+      LWA_CLIENT_SECRET: ${LWA_CLIENT_SECRET:?missing LWA_CLIENT_SECRET}
+      LWA_REFRESH_TOKEN: ${LWA_REFRESH_TOKEN:?missing LWA_REFRESH_TOKEN}
+      MARKETPLACE_ID: ${MARKETPLACE_ID:-A21TJRUUN4KGV}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
