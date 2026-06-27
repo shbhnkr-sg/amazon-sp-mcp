@@ -155,9 +155,10 @@ def _window(days_ago=None, after=None, before=None, *, floor_to_day=False,
     start = parse(after) if after else now_local - timedelta(days=days_ago or 0)
     end = parse(before) if before else now_local
     if floor_to_day:
+        # Floor in IST regardless of the input's tz, so buckets land on IST midnight.
         midnight = dict(hour=0, minute=0, second=0, microsecond=0)
-        start = start.replace(**midnight)
-        end = end.replace(**midnight)
+        start = start.astimezone(zone).replace(**midnight)
+        end = end.astimezone(zone).replace(**midnight)
     return _iso(start.astimezone(timezone.utc)), _iso(end.astimezone(timezone.utc))
 
 
@@ -218,11 +219,15 @@ def _cap_report(text, report_type, max_rows, fields):
     projection via ``fields`` (comma-separated header names).
     """
     if report_type in _JSON_REPORTS:
+        if len(text) > _MAX_JSON_CHARS:
+            # Don't return a huge parsed object that blows the token budget.
+            return {"format": "json", "truncated": True,
+                    "content_excerpt": text[:_MAX_JSON_CHARS],
+                    "note": "report exceeds the size cap; narrow the date range"}
         try:
             return {"format": "json", "content": json.loads(text)}
         except Exception:
-            return {"format": "json", "content": text[:_MAX_JSON_CHARS],
-                    "truncated": len(text) > _MAX_JSON_CHARS}
+            return {"format": "json", "content": text, "truncated": False}
     lines = text.splitlines()
     if not lines:
         return {"format": "tsv", "rows": 0, "truncated": False, "content": ""}
