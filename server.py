@@ -394,8 +394,12 @@ def _poll_report(r, report_id, *, attempts=15, delay=4):
                                   "message": "report DONE but no reportDocumentId",
                                   "reportId": report_id}}
             return (_with_retry(lambda: r.get_report_document(doc_id)).payload) or {}
-        if ps in ("CANCELLED", "FATAL"):
-            return {"error": {"type": "ReportError", "message": f"report {ps}",
+        if ps == "CANCELLED":
+            # Amazon cancels reports with no records for the period — treat as empty, not an error.
+            return {"status": "NO_DATA", "reportId": report_id,
+                    "message": "report cancelled by Amazon — usually means no records for the period"}
+        if ps == "FATAL":
+            return {"error": {"type": "ReportError", "message": "report FATAL",
                               "reportId": report_id}}
         time.sleep(delay)
     return {"status": "IN_PROGRESS", "reportId": report_id,
@@ -426,7 +430,7 @@ def _request_and_fetch_report(report_type, days_ago=30, after=None, before=None,
                               "message": "create_report returned no reportId",
                               "payload": created}}
     doc = _poll_report(r, report_id)
-    if "error" in doc or doc.get("status") == "IN_PROGRESS":
+    if "error" in doc or "status" in doc:
         return doc
     result = _cap_report(_extract_report_text(doc), report_type, max_rows, fields)
     result["reportId"] = report_id
@@ -557,15 +561,13 @@ def get_catalog_item(asin: str, included_data: str = "attributes,summaries,image
 def search_catalog(keywords: str, page_size: int = 10, page_token: str = None,
                    included_data: str = "summaries") -> dict:
     """Search catalog by keywords. Returns ASINs, titles, and basic product info.
-    Pass page_token (from a previous response's next_token) to page; when paging,
-    keywords/page_size are ignored by Amazon. included_data is a comma list."""
+    Pass page_token (from a previous response's next_token) to fetch the next page.
+    included_data is a comma list."""
     included = [s.strip() for s in included_data.split(",") if s.strip()]
+    kwargs = {"keywords": keywords, "marketplaceIds": [MARKETPLACE],
+              "includedData": included, "pageSize": page_size}
     if page_token:
-        kwargs = {"marketplaceIds": [MARKETPLACE], "includedData": included,
-                  "pageToken": page_token}
-    else:
-        kwargs = {"keywords": keywords, "marketplaceIds": [MARKETPLACE],
-                  "includedData": included, "pageSize": page_size}
+        kwargs["pageToken"] = page_token
     resp = CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).search_catalog_items(**kwargs)
     payload = resp.payload or {}
     payload["next_token"] = (getattr(resp, "pagination", None) or {}).get("nextToken")
