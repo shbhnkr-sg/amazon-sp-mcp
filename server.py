@@ -200,7 +200,15 @@ def _extract_report_text(doc_payload):
     url = doc_payload.get("url")
     if not url:
         return ""
-    raw = urllib.request.urlopen(url, timeout=30).read()
+    raw = None
+    for _attempt in range(3):
+        try:
+            raw = urllib.request.urlopen(url, timeout=30).read()
+            break
+        except Exception:
+            if _attempt == 2:
+                raise
+            time.sleep(2 ** _attempt)
     if doc_payload.get("compressionAlgorithm") == "GZIP":
         raw = gzip.decompress(raw)
     for enc in ("utf-8", "cp1252", "latin-1"):
@@ -211,7 +219,7 @@ def _extract_report_text(doc_payload):
     return raw.decode("utf-8", errors="replace")
 
 
-def _cap_report(text, report_type, max_rows, fields):
+def _cap_report(text, report_type, max_rows, fields, by="date"):
     """Bound a report body for the token budget.
 
     JSON reports (sales & traffic) are parsed and returned as an object with a
@@ -219,15 +227,20 @@ def _cap_report(text, report_type, max_rows, fields):
     projection via ``fields`` (comma-separated header names).
     """
     if report_type in _JSON_REPORTS:
-        if len(text) > _MAX_JSON_CHARS:
-            # Don't return a huge parsed object that blows the token budget.
-            return {"format": "json", "truncated": True,
-                    "content_excerpt": text[:_MAX_JSON_CHARS],
-                    "note": "report exceeds the size cap; narrow the date range"}
         try:
-            return {"format": "json", "content": json.loads(text)}
+            doc = json.loads(text)
         except Exception:
-            return {"format": "json", "content": text, "truncated": False}
+            return {"format": "json", "content": text[:_MAX_JSON_CHARS],
+                    "truncated": len(text) > _MAX_JSON_CHARS}
+        by_asin = doc.get("salesAndTrafficByAsin") or []
+        out = {"format": "json", "reportSpecification": doc.get("reportSpecification")}
+        if by in ("date", "both"):
+            out["salesAndTrafficByDate"] = doc.get("salesAndTrafficByDate") or []
+        if by in ("asin", "both"):
+            out["salesAndTrafficByAsin"] = by_asin[:max_rows]
+            out["asinCount"] = len(by_asin)
+            out["asinTruncated"] = len(by_asin) > max_rows
+        return out
     lines = text.splitlines()
     if not lines:
         return {"format": "tsv", "rows": 0, "truncated": False, "content": ""}
@@ -377,7 +390,7 @@ def get_sales_metrics(days_ago: int = 30, granularity: str = "Day",
 
 # --- Reports (async — request → poll → download) ------------------------------
 
-def _poll_report(r, report_id, *, attempts=15, delay=4):
+def _poll_report(r, report_id, *, attempts=10, delay=4):
     """Poll a report to completion (status checked before the first sleep).
 
     Bounded to ~attempts*delay seconds to stay under the MCP gateway timeout.
@@ -409,7 +422,7 @@ def _poll_report(r, report_id, *, attempts=15, delay=4):
 
 def _request_and_fetch_report(report_type, days_ago=30, after=None, before=None,
                               extra_options=None, max_rows=500, fields=None,
-                              report_id=None):
+                              by="date", report_id=None):
     """Request a report (or resume an existing one), poll, fetch, and bound it.
 
     Pass ``report_id`` to skip creation and just fetch an already-requested
@@ -432,7 +445,7 @@ def _request_and_fetch_report(report_type, days_ago=30, after=None, before=None,
     doc = _poll_report(r, report_id)
     if "error" in doc or "status" in doc:
         return doc
-    result = _cap_report(_extract_report_text(doc), report_type, max_rows, fields)
+    result = _cap_report(_extract_report_text(doc), report_type, max_rows, fields, by=by)
     result["reportId"] = report_id
     return result
 
@@ -515,11 +528,13 @@ def get_inventory_ledger(days_ago: int = 30, after: str = None, before: str = No
 @mcp.tool()
 @tool_safe
 def get_sales_traffic_report(days_ago: int = 30, after: str = None, before: str = None,
-                             report_id: str = None) -> dict:
-    """Get sales & traffic report — sessions, page views, buy box %, conversion rate
-    by ASIN (JSON document) for the last N days or an IST date range."""
+                             by: str = "date", max_rows: int = 500, report_id: str = None) -> dict:
+    """Get sales & traffic report (JSON). by="date" returns daily KPIs (sessions,
+    page views, units, sales, buy-box %, conversion) — small & complete; by="asin"
+    returns per-ASIN rows (capped at max_rows); by="both" returns both. Last N days
+    or an IST range."""
     return _request_and_fetch_report("GET_SALES_AND_TRAFFIC_REPORT", days_ago, after, before,
-                                     report_id=report_id)
+                                     max_rows=max_rows, by=by, report_id=report_id)
 
 
 # --- Fee estimates ------------------------------------------------------------
