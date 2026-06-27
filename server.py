@@ -326,10 +326,12 @@ def get_inventory_summary(seller_skus: str = None, details: bool = True,
 
     def call(token):
         # FBA Inventory requires the SAME params on every page plus startDateTime to
-        # emit a pagination token at all; a far-past start filters nothing out.
+        # emit a pagination token at all. FBA Inventory rejects startDateTime older
+        # than ~18 months, so use ~540 days (the max safe lookback) — this both
+        # enables the pagination token and covers essentially all active inventory.
         kwargs = {"details": details, "granularityType": "Marketplace",
                   "granularityId": MARKETPLACE, "marketplaceIds": [MARKETPLACE],
-                  "startDateTime": "2015-01-01T00:00:00Z"}
+                  "startDateTime": _iso(datetime.now(timezone.utc) - timedelta(days=540))}
         if skus:
             kwargs["sellerSkus"] = skus
         cursor = token or next_token
