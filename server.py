@@ -282,7 +282,9 @@ def get_orders(days_ago: int = 7, created_after: str = None, created_before: str
     or "all" to omit the filter. fulfillment_channels filters AFN/MFN. Paginated up
     to ~max_orders (page-aligned, ~100/page); pass back next_token to resume. fields
     is a comma-separated projection (e.g. "AmazonOrderId,OrderStatus,OrderTotal,
-    PurchaseDate") to shrink the response. PurchaseDate values are UTC."""
+    PurchaseDate") to shrink the response. PurchaseDate values are UTC.
+    A created_before within ~2 min of now is rejected by Amazon; pass an older
+    bound or omit it (omitting returns orders up to now)."""
     ca, cb = _window(days_ago, created_after, created_before)
     statuses = None if status.strip().lower() == "all" else [s.strip() for s in status.split(",") if s.strip()]
     channels = [c.strip() for c in fulfillment_channels.split(",") if c.strip()] if fulfillment_channels else None
@@ -292,7 +294,12 @@ def get_orders(days_ago: int = 7, created_after: str = None, created_before: str
         if cursor:
             kwargs = {"NextToken": cursor}  # Amazon rejects a token combined with other filters
         else:
-            kwargs = {"CreatedAfter": ca, "CreatedBefore": cb, "MarketplaceIds": [MARKETPLACE]}
+            kwargs = {"CreatedAfter": ca, "MarketplaceIds": [MARKETPLACE]}
+            # getOrders rejects a CreatedBefore within ~2 min of now; only send an
+            # upper bound when the caller explicitly asked for one. Omitting it lets
+            # Amazon default to "up to now" safely.
+            if created_before:
+                kwargs["CreatedBefore"] = cb
             if statuses:
                 kwargs["OrderStatuses"] = statuses
             if channels:
@@ -518,11 +525,21 @@ def get_fba_long_term_storage_fees(max_rows: int = 500, fields: str = None,
 @mcp.tool()
 @tool_safe
 def get_inventory_ledger(days_ago: int = 30, after: str = None, before: str = None,
+                         aggregated_by: str = "DAILY", aggregate_by_location: str = "FC",
                          max_rows: int = 500, fields: str = None, report_id: str = None) -> dict:
-    """Get inventory ledger report — all inventory movements (receipts, shipments,
-    removals, adjustments) for the last N days or an IST date range."""
+    """Get inventory ledger report — inventory movements (receipts, shipments,
+    removals, adjustments) for the last N days or an IST date range. The SUMMARY
+    view aggregates by whole periods: aggregated_by="DAILY" (default) returns one
+    row per SKU per day so a rolling window yields data; "MONTHLY" returns one row
+    per SKU per complete calendar month. aggregate_by_location="FC" (default) keeps
+    per-fulfillment-center rows; "COUNTRY" collapses them to one row per SKU/period.
+    A 30-day DAILY/FC ledger is large — narrow the range or use fields/max_rows."""
+    extra = None if report_id else {
+        "reportOptions": {"aggregateByLocation": aggregate_by_location,
+                          "aggregatedByTimePeriod": aggregated_by}}
     return _request_and_fetch_report("GET_LEDGER_SUMMARY_VIEW_DATA", days_ago, after, before,
-                                     max_rows=max_rows, fields=fields, report_id=report_id)
+                                     extra_options=extra, max_rows=max_rows, fields=fields,
+                                     report_id=report_id)
 
 
 @mcp.tool()
