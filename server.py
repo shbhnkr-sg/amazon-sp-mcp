@@ -335,7 +335,8 @@ def get_inventory_summary(seller_skus: str = None, details: bool = True,
         cursor = token or next_token
         if cursor:
             kwargs["nextToken"] = cursor
-        return Inventories(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_inventory_summary_marketplace(**kwargs).payload
+        resp = Inventories(credentials=creds(), marketplace=MARKETPLACE_ENUM).get_inventory_summary_marketplace(**kwargs)
+        return {**(resp.payload or {}), "pagination": getattr(resp, "pagination", None)}
 
     items, truncated, tok = _paginate(
         call, "inventorySummaries",
@@ -369,7 +370,7 @@ def get_sales_metrics(days_ago: int = 30, granularity: str = "Day",
     )
     # get_order_metrics returns a JSON array; MCP structured output needs a
     # top-level object, so wrap the list under a key.
-    return {"metrics": res.payload}
+    return {"metrics": res.payload if isinstance(res.payload, list) else []}
 
 
 # --- Reports (async — request → poll → download) ------------------------------
@@ -563,8 +564,9 @@ def search_catalog(keywords: str, page_size: int = 10, page_token: str = None,
     else:
         kwargs = {"keywords": keywords, "marketplaceIds": [MARKETPLACE],
                   "includedData": included, "pageSize": page_size}
-    payload = CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).search_catalog_items(**kwargs).payload
-    payload["next_token"] = (payload.get("pagination") or {}).get("nextToken")
+    resp = CatalogItems(credentials=creds(), marketplace=MARKETPLACE_ENUM).search_catalog_items(**kwargs)
+    payload = resp.payload or {}
+    payload["next_token"] = (getattr(resp, "pagination", None) or {}).get("nextToken")
     return payload
 
 
