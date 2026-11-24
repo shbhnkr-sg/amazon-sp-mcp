@@ -1,9 +1,15 @@
 services:
   amazon-sp-mcp:
+    # Production pulls the CI-built image; `build: .` is for local dev only.
+    image: ghcr.io/shbhnkr-sg/amazon-sp-mcp:latest
     build: .
-    image: amazon-sp-mcp:latest
     container_name: amazon-sp-mcp
     restart: unless-stopped
+    labels:
+      # Watchtower pulls new :latest images (built by CI on every main push).
+      # The upgrade delay lives in Dependabot (cooldown), so none here.
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.cooldown-delay: "0"
     # Exposed on all host interfaces so other LAN devices can connect.
     # NOTE: the server has no auth — anyone who can reach this port can read
     # your Amazon seller data. Keep this host on a trusted network only.
