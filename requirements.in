@@ -1,4 +1,4 @@
 fastmcp>=3.4
-python-amazon-sp-api>=2.1
-python-dotenv>=1.0
-tzdata>=2024.1
+python-amazon-sp-api>=2.1.44
+python-dotenv>=1.2.4
+tzdata>=2026.6
