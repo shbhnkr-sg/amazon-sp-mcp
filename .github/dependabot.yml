@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: daily
+    # Wait 3 days after a release before proposing it (bad releases get
+    # yanked or patched in that window). Security updates skip the cooldown.
+    cooldown:
+      default-days: 3
+    groups:
+      python-deps:
+        applies-to: version-updates
+        patterns: ["*"]
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
