@@ -74,6 +74,18 @@ async def test_shipment_items_follow_pagination(api):
     assert params(route, 1)["paginationToken"] == ["T"]
 
 
+async def test_inbound_by_fc_skips_awd_plans(api):
+    mock_one_plan(api)
+    api.get(f"{IB}/inboundPlans").mock(return_value=ok({
+        "inboundPlans": [{"inboundPlanId": "AWD1"}, {"inboundPlanId": "P1"}]}))
+    api.get(f"{IB}/inboundPlans/AWD1").mock(return_value=httpx.Response(400, json={
+        "errors": [{"code": "BadRequest", "message": "ERROR: Operation GetInboundPlan is not "
+                    "supported for Amazon Warehousing and Distribution inbound plans."}]}))
+    res = await call("get_inbound_by_fc")
+    assert res["skipped_awd_plans"] == 1
+    assert res["total"] == 12
+
+
 def test_health_endpoint_over_http():
     app = server.mcp.http_app(transport="streamable-http", path="/mcp")
     with TestClient(app) as c:
