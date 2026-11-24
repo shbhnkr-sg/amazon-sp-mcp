@@ -16,13 +16,13 @@ Both **Claude Code** and **Codex** connect to the same URL, from any device
 
 ## Tools (14)
 
-| Category | Tools |
-|----------|-------|
-| Orders | `get_orders`, `get_order`, `get_order_items` |
-| Inventory (FBA) | `get_inventory_summary`, `get_inventory_ledger` |
-| Sales | `get_sales_metrics`, `get_sales_traffic_report` |
-| Finance / fees | `get_settlement_report`, `get_fba_reimbursements`, `get_fba_storage_fees`, `get_fba_long_term_storage_fees`, `get_fee_estimate` |
-| Catalog | `get_catalog_item`, `search_catalog` |
+| Category        | Tools                                                                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Orders          | `get_orders`, `get_order`, `get_order_items`                                                                                    |
+| Inventory (FBA) | `get_inventory_summary`, `get_inventory_ledger`                                                                                 |
+| Sales           | `get_sales_metrics`, `get_sales_traffic_report`                                                                                 |
+| Finance / fees  | `get_settlement_report`, `get_fba_reimbursements`, `get_fba_storage_fees`, `get_fba_long_term_storage_fees`, `get_fee_estimate` |
+| Catalog         | `get_catalog_item`, `search_catalog`                                                                                            |
 
 Report-backed tools (settlement, reimbursements, storage fees, ledger, traffic)
 use the SP-API async Reports flow: request → poll → download.
@@ -66,8 +66,22 @@ MARKETPLACE_ID=A21TJRUUN4KGV
 
 ## Deploy (on the Linux host)
 
+Deploys are automatic:
+
+1. Dependabot opens a PR when a dependency releases (after a 3-day cooldown).
+2. CI (`.github/workflows/ci.yml`) runs the tests and a container smoke test, then auto-merges Dependabot PRs that pass.
+3. Every push to `main` publishes `ghcr.io/shbhnkr-sg/amazon-sp-mcp:latest` (and `:sha-<commit>`).
+4. Watchtower on the host pulls the new `:latest` within 24h and recreates the container.
+
+Deploy now instead of waiting for Watchtower:
+
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d --force-recreate
+```
+
+Roll back: set `image:` in the host's `docker-compose.yml` to a known-good `ghcr.io/shbhnkr-sg/amazon-sp-mcp:sha-<commit>`, run the command above, and remove the `com.centurylinklabs.watchtower.enable` label so Watchtower doesn't move it back. Revert the bad commit on `main`, then restore `:latest` and the label.
+
+```bash
 docker compose ps
 docker compose logs -f amazon-sp-mcp
 ```
@@ -86,8 +100,8 @@ unauthenticated server to the entire LAN** — use only on a trusted network.
 `docker-compose.yml` (already set this way):
 
 ```yaml
-    ports:
-      - "3100:3000"        # binds 0.0.0.0
+ports:
+  - "3100:3000" # binds 0.0.0.0
 ```
 
 Open the host firewall if one is active, then connect via the host's LAN IP:
@@ -109,8 +123,8 @@ Tailscale Serve expose it over TLS.
 `docker-compose.yml`:
 
 ```yaml
-    ports:
-      - "127.0.0.1:3100:3000"   # localhost-only; not on the LAN
+ports:
+  - "127.0.0.1:3100:3000" # localhost-only; not on the LAN
 ```
 
 On the host:
