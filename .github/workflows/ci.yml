@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# Runs on main queue in commit order (a newer queued run replaces an older
+# queued one), so publish never pushes an older sha over :latest.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -45,10 +51,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # A newer main run cancels an older one, so :latest never goes backwards.
-    concurrency:
-      group: publish
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
