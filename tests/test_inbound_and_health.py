@@ -51,10 +51,8 @@ async def test_inbound_by_fc_status_filter_skips_shipment_fetch(api):
     assert res["rows"] == [] and res["shipments"] == 0
 
 
-# The library hoists a top-level `pagination` key to resp.pagination (payload-or-kwargs
-# quirk), but get_inbound_by_fc reads it off .payload, so page 2 is never requested.
-@pytest.mark.xfail(reason="server reads pagination from .payload; library moves it to resp.pagination",
-                   strict=False)
+# The library hoists a top-level `pagination` key off .payload onto resp.pagination
+# (payload-or-kwargs quirk), so the token must be read from the response object.
 async def test_inbound_plans_follow_pagination(api):
     route = api.get(f"{IB}/inboundPlans").mock(side_effect=[
         ok({"inboundPlans": [{"inboundPlanId": "P1"}], "pagination": {"nextToken": "N"}}),
@@ -64,6 +62,16 @@ async def test_inbound_plans_follow_pagination(api):
     res = await call("get_inbound_by_fc")
     assert res["plans"] == 2
     assert params(route, 1)["paginationToken"] == ["N"]
+
+
+async def test_shipment_items_follow_pagination(api):
+    mock_one_plan(api)
+    route = api.get(f"{IB}/inboundPlans/P1/shipments/S1/items").mock(side_effect=[
+        ok({"items": [{"msku": "SKU1", "quantity": 5}], "pagination": {"nextToken": "T"}}),
+        ok({"items": [{"msku": "SKU1", "quantity": 4}]})])
+    res = await call("get_inbound_by_fc")
+    assert res["rows"] == [{"fc": "BOM5", "sku": "SKU1", "qty": 9}]
+    assert params(route, 1)["paginationToken"] == ["T"]
 
 
 def test_health_endpoint_over_http():

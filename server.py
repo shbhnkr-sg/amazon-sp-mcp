@@ -601,9 +601,10 @@ def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,
         kw = {"pageSize": 30}
         if token:
             kw["paginationToken"] = token
-        pl = (_with_retry(lambda: g.list_inbound_plans(**kw)).payload) or {}
-        plans.extend(pl.get("inboundPlans") or [])
-        token = pl.get("pagination", {}).get("nextToken") if isinstance(pl.get("pagination"), dict) else pl.get("nextToken")
+        resp = _with_retry(lambda: g.list_inbound_plans(**kw))
+        plans.extend((resp.payload or {}).get("inboundPlans") or [])
+        # The library hoists `pagination` off .payload onto the response object.
+        token = (getattr(resp, "pagination", None) or {}).get("nextToken")
         if not token or len(plans) >= max_plans:
             break
 
@@ -630,7 +631,8 @@ def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,
                 ikw = {"inboundPlanId": pid, "shipmentId": sid}
                 if itok:
                     ikw["paginationToken"] = itok
-                res = (_with_retry(lambda: g.list_shipment_items(**ikw)).payload) or {}
+                resp = _with_retry(lambda: g.list_shipment_items(**ikw))
+                res = resp.payload or {}
                 for it in (res.get("items") or []):
                     sku = it.get("msku")
                     if not sku:
@@ -638,8 +640,7 @@ def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,
                     q = int(it.get("quantity") or 0)
                     agg[(fc, sku)] = agg.get((fc, sku), 0) + q
                     by_status[st] = by_status.get(st, 0) + q
-                pg = res.get("pagination")
-                itok = pg.get("nextToken") if isinstance(pg, dict) else None
+                itok = (getattr(resp, "pagination", None) or {}).get("nextToken")
                 if not itok:
                     break
 
