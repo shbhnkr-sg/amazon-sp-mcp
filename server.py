@@ -21,6 +21,7 @@ from sp_api.api import (
     CatalogItems,
     ProductFees,
 )
+from sp_api.api.finances.finances_v0 import FinancesV0
 from sp_api.base import Marketplaces, Granularity
 from sp_api.base.exceptions import SellingApiException
 
@@ -544,6 +545,111 @@ def get_inventory_ledger(days_ago: int = 30, after: str = None, before: str = No
 
 @mcp.tool()
 @tool_safe
+def get_fulfilled_shipments(days_ago: int = 30, after: str = None, before: str = None,
+                            max_rows: int = 500, fields: str = None,
+                            report_id: str = None) -> dict:
+    """Get the FBA Amazon-Fulfilled Shipments report — one row per shipped item
+    with seller SKU, quantity shipped, and the customer ship-to city / state /
+    postal code. This is the source for regional demand analysis: which pincodes
+    drive which SKUs. Last N days or an IST date range; Amazon caps the window at
+    roughly 30 days. The report is large — bound it with max_rows/fields."""
+    return _request_and_fetch_report("GET_AMAZON_FULFILLED_SHIPMENTS_DATA_GENERAL",
+                                     days_ago, after, before,
+                                     max_rows=max_rows, fields=fields,
+                                     report_id=report_id)
+
+
+@mcp.tool()
+@tool_safe
+def get_report(report_type: str, days_ago: int = 30, after: str = None, before: str = None,
+               max_rows: int = 500, fields: str = None, report_options: dict = None,
+               report_id: str = None) -> dict:
+    """Request ANY SP-API report by its report type string, poll, and return it.
+
+    Escape hatch for report types that have no dedicated tool, e.g.
+    GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA (per-SKU inbound working/shipped/
+    receiving quantities) or GET_MERCHANT_LISTINGS_ALL_DATA. Pass report_options
+    as a dict when the report needs them. Returns {"status": "IN_PROGRESS",
+    "reportId": ...} while Amazon generates it — re-call with report_id to fetch."""
+    return _request_and_fetch_report(report_type, days_ago, after, before,
+                                     extra_options=({"reportOptions": report_options}
+                                                    if report_options and not report_id else None),
+                                     max_rows=max_rows, fields=fields, report_id=report_id)
+
+
+@mcp.tool()
+@tool_safe
+def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,DELIVERED,CHECKED_IN,RECEIVING",
+                      max_plans: int = 200) -> dict:
+    """Inbound units broken down by DESTINATION fulfilment centre and SKU.
+
+    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20), reads each
+    shipment's destination.warehouseId, and sums its line items. This is what
+    replenishment planning needs: the per-SKU inbound totals in the MYI report
+    are national and cannot say which FC the stock is heading to.
+
+    Returns {"rows": [{fc, sku, qty, status}], "plans": n, "shipments": n,
+    "by_status": {...}, "total": n}.
+    """
+    from sp_api.api import FulfillmentInboundV20240320 as G
+    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+    want = {s.strip().upper() for s in statuses.split(",") if s.strip()}
+
+    plans, token, pages = [], None, 0
+    while pages < 20:
+        pages += 1
+        kw = {"pageSize": 30}
+        if token:
+            kw["paginationToken"] = token
+        pl = (_with_retry(lambda: g.list_inbound_plans(**kw)).payload) or {}
+        plans.extend(pl.get("inboundPlans") or [])
+        token = pl.get("pagination", {}).get("nextToken") if isinstance(pl.get("pagination"), dict) else pl.get("nextToken")
+        if not token or len(plans) >= max_plans:
+            break
+
+    agg, by_status, nship = {}, {}, 0
+    for p in plans[:max_plans]:
+        pid = p.get("inboundPlanId")
+        if not pid:
+            continue
+        det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid)).payload) or {}
+        for sh in (det.get("shipments") or []):
+            st = (sh.get("status") or "").upper()
+            by_status[st] = by_status.get(st, 0)
+            if st not in want:
+                continue
+            sid = sh.get("shipmentId")
+            if not sid:
+                continue
+            full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid)).payload) or {}
+            fc = ((full.get("destination") or {}).get("warehouseId")) or "UNKNOWN"
+            nship += 1
+            itok, ip = None, 0
+            while ip < 20:
+                ip += 1
+                ikw = {"inboundPlanId": pid, "shipmentId": sid}
+                if itok:
+                    ikw["paginationToken"] = itok
+                res = (_with_retry(lambda: g.list_shipment_items(**ikw)).payload) or {}
+                for it in (res.get("items") or []):
+                    sku = it.get("msku")
+                    if not sku:
+                        continue
+                    q = int(it.get("quantity") or 0)
+                    agg[(fc, sku)] = agg.get((fc, sku), 0) + q
+                    by_status[st] = by_status.get(st, 0) + q
+                pg = res.get("pagination")
+                itok = pg.get("nextToken") if isinstance(pg, dict) else None
+                if not itok:
+                    break
+
+    rows = [{"fc": fc, "sku": sku, "qty": q} for (fc, sku), q in sorted(agg.items())]
+    return {"rows": rows, "plans": len(plans), "shipments": nship,
+            "by_status": by_status, "total": sum(r["qty"] for r in rows)}
+
+
+@mcp.tool()
+@tool_safe
 def get_sales_traffic_report(days_ago: int = 30, after: str = None, before: str = None,
                              by: str = "date", max_rows: int = 500, report_id: str = None) -> dict:
     """Get sales & traffic report (JSON). by="date" returns daily KPIs (sessions,
@@ -552,6 +658,52 @@ def get_sales_traffic_report(days_ago: int = 30, after: str = None, before: str 
     or an IST range."""
     return _request_and_fetch_report("GET_SALES_AND_TRAFFIC_REPORT", days_ago, after, before,
                                      max_rows=max_rows, by=by, report_id=report_id)
+
+
+# --- Finances -----------------------------------------------------------------
+
+@mcp.tool()
+@tool_safe
+def get_financial_events(days_ago: int = 30, after: str = None, before: str = None,
+                         event_types: str = None, max_events: int = 500,
+                         next_token: str = None) -> dict:
+    """Get per-item charges and fees for the last N days or an IST date range,
+    flattened to one row per shipped/refunded item: posted_date, order_id, sku,
+    quantity, principal, tax, a fee_type -> amount dict and total_fees. Amounts use
+    Amazon's signs (fees negative; refund rows negative throughout). event_types is
+    a comma list of "shipment" and/or "refund" (default both). Paginated up to
+    ~max_events rows; pass back next_token to resume."""
+    start, end = _window(days_ago, after, before)
+    lists = {"shipment": "ShipmentEventList", "refund": "RefundEventList"}
+    wanted = [e.strip().lower() for e in event_types.split(",")] if event_types else list(lists)
+    rows, token = [], next_token
+    for _ in range(20):
+        # Amazon rejects a NextToken combined with the date filters, so send one or the other.
+        kwargs = {"NextToken": token} if token else {"PostedAfter": start, "PostedBefore": end,
+                                                    "MaxResultsPerPage": 100}
+        payload = _with_retry(lambda: FinancesV0(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+                              .list_financial_events(**kwargs).payload) or {}
+        events = payload.get("FinancialEvents") or {}
+        for kind in wanted:
+            for ev in (events.get(lists.get(kind)) or []):
+                # Refund events carry the same shape under *Adjustment* keys.
+                for it in (ev.get("ShipmentItemList") or ev.get("ShipmentItemAdjustmentList") or []):
+                    charges = {c.get("ChargeType"): (c.get("ChargeAmount") or {}).get("CurrencyAmount", 0)
+                               for c in (it.get("ItemChargeList") or it.get("ItemChargeAdjustmentList") or [])}
+                    fees = {}
+                    for f in (it.get("ItemFeeList") or it.get("ItemFeeAdjustmentList") or []):
+                        amt = (f.get("FeeAmount") or {}).get("CurrencyAmount", 0)
+                        fees[f.get("FeeType")] = round(fees.get(f.get("FeeType"), 0) + amt, 2)
+                    rows.append({"posted_date": ev.get("PostedDate"), "order_id": ev.get("AmazonOrderId"),
+                                 "sku": it.get("SellerSKU"), "quantity": it.get("QuantityShipped"),
+                                 "event_type": kind, "principal": charges.get("Principal", 0),
+                                 "tax": round(sum(v for k, v in charges.items() if k and k.endswith("Tax")), 2),
+                                 "fees": fees, "total_fees": round(sum(fees.values()), 2)})
+        token = payload.get("NextToken")
+        if not token or len(rows) >= max_events:
+            break
+    return {"events": rows[:max_events], "count": min(len(rows), max_events),
+            "truncated": len(rows) > max_events, "next_token": token}
 
 
 # --- Fee estimates ------------------------------------------------------------
