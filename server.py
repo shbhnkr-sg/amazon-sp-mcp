@@ -659,6 +659,111 @@ def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,
 
 @mcp.tool()
 @tool_safe
+def get_confirmed_inbound_pickups(fcs: str = "", statuses: str = "READY_TO_SHIP",
+                                  days: int = 30) -> dict:
+    """Carrier pickup details for confirmed inbound shipments (read-only).
+
+    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20, newest first,
+    stopping once plans are older than ``days``), keeps shipments whose status is
+    in ``statuses`` and whose destination FC is in ``fcs`` (comma-separated FC
+    codes; empty means every FC), and returns the
+    selected transportation option: carrier, shipping solution, pickup
+    appointment window, voidable-until and cost.
+
+    Returns {"shipments": [{plan_id, shipment_id, confirmation_id, status, fc,
+    transportation_option_id, carrier, shipping_solution, appt_start, appt_end,
+    voidable_until, cost_inr}], "plans_scanned", "pages", "skipped"}. ``skipped``
+    counts plans that could not be read (AWD plans).
+    """
+    from sp_api.api import FulfillmentInboundV20240320 as G
+    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+    want_st = {s.strip().upper() for s in statuses.split(",") if s.strip()}
+    want_fc = {s.strip().upper() for s in fcs.split(",") if s.strip()}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def _ts(v):
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except Exception:  # noqa: BLE001
+            return None
+
+    out, scanned, skipped, pages, token, done = [], 0, 0, 0, None, False
+    while pages < 20 and not done:
+        pages += 1
+        kw = {"pageSize": 30}
+        if token:
+            kw["paginationToken"] = token
+        else:
+            kw.update(status="ACTIVE", sortBy="CREATION_TIME", sortOrder="DESC")
+        resp = _with_retry(lambda: g.list_inbound_plans(**kw))
+        for p in ((resp.payload or {}).get("inboundPlans") or []):
+            created = _ts(p.get("createdAt"))
+            if created and created < cutoff:
+                done = True
+                break
+            pid = p.get("inboundPlanId")
+            if not pid:
+                continue
+            try:
+                det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid)).payload) or {}
+            except SellingApiException as e:
+                if getattr(e, "code", None) == 400:
+                    skipped += 1
+                    continue
+                raise
+            scanned += 1
+            for sh in (det.get("shipments") or []):
+                sid = sh.get("shipmentId")
+                if not sid:
+                    continue
+                st = (sh.get("status") or "").upper()
+                if not st or st not in want_st:
+                    if st:
+                        continue
+                full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid)).payload) or {}
+                if not st:
+                    st = (full.get("status") or "").upper()
+                    if st not in want_st:
+                        continue
+                fc = ((full.get("destination") or {}).get("warehouseId")) or ""
+                if want_fc and fc.upper() not in want_fc:
+                    continue
+                sel = full.get("selectedTransportationOptionId")
+                opt, otok, op = {}, None, 0
+                while op < 10 and not opt:
+                    op += 1
+                    okw = {"inboundPlanId": pid, "shipmentId": sid}
+                    if otok:
+                        okw["paginationToken"] = otok
+                    r = _with_retry(lambda: g.list_transportation_options(**okw))
+                    for o in ((r.payload or {}).get("transportationOptions") or []):
+                        if o.get("transportationOptionId") == sel:
+                            opt = o
+                            break
+                    otok = r.next_token
+                    if not otok:
+                        break
+                ap = opt.get("carrierAppointment") or {}
+                qt = opt.get("quote") or {}
+                out.append({
+                    "plan_id": pid, "shipment_id": sid,
+                    "confirmation_id": full.get("shipmentConfirmationId"),
+                    "status": st, "fc": fc, "transportation_option_id": sel,
+                    "carrier": (opt.get("carrier") or {}).get("alphaCode"),
+                    "shipping_solution": opt.get("shippingSolution"),
+                    "appt_start": ap.get("startTime"), "appt_end": ap.get("endTime"),
+                    "voidable_until": qt.get("voidableUntil"),
+                    "cost_inr": (qt.get("cost") or {}).get("amount"),
+                })
+        token = resp.next_token
+        if not token:
+            break
+    return {"shipments": out, "plans_scanned": scanned, "pages": pages, "skipped": skipped}
+
+
+@mcp.tool()
+@tool_safe
 def get_sales_traffic_report(days_ago: int = 30, after: str = None, before: str = None,
                              by: str = "date", max_rows: int = 500, report_id: str = None) -> dict:
     """Get sales & traffic report (JSON). by="date" returns daily KPIs (sessions,

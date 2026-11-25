@@ -106,5 +106,5 @@ EXPECTED_TOOLS = {
     "get_fba_storage_fees", "get_fba_long_term_storage_fees", "get_inventory_ledger",
     "get_fulfilled_shipments", "get_report", "get_inbound_by_fc",
     "get_sales_traffic_report", "get_financial_events", "get_fee_estimate",
-    "get_catalog_item", "search_catalog",
+    "get_catalog_item", "search_catalog", "get_confirmed_inbound_pickups",
 }
