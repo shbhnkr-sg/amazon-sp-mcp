@@ -872,6 +872,170 @@ def search_catalog(keywords: str, page_size: int = 10, page_token: str = None,
     return payload
 
 
+# --- Inbound reads, pricing, listings ----------------------------------------
+# Read-only. The inbound walks retry throttles for ~1 min (7 attempts) because a
+# planner reading every shipment has no use for a partial answer.
+
+_PATIENT = 7
+
+
+def _inbound_plan(g, pid, created_at=None):
+    """One plan with each shipment's status, confirmation id and destination FC.
+
+    A shipment's status is getShipment's, else the one listed on the plan."""
+    det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid),
+                       max_attempts=_PATIENT).payload) or {}
+    ships = []
+    for sh in det.get("shipments") or []:
+        sid = sh.get("shipmentId")
+        if not sid:
+            continue
+        full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid),
+                            max_attempts=_PATIENT).payload) or {}
+        ships.append({"shipment_id": sid, "status": full.get("status") or sh.get("status"),
+                      "confirmation_id": full.get("shipmentConfirmationId"),
+                      "destination": (full.get("destination") or {}).get("warehouseId")})
+    return {"plan_id": pid, "status": det.get("status"),
+            "created_at": created_at or det.get("createdAt"), "shipments": ships}
+
+
+@mcp.tool()
+@tool_safe
+def get_inbound_plans(statuses: str = "ACTIVE,SHIPPED", days: int = 120,
+                      plan_ids: str = None) -> dict:
+    """Inbound plans (Fulfillment Inbound v2024-03-20) with every shipment's status,
+    confirmation id (FBA...) and destination FC (read-only).
+
+    Lists plans for each status in ``statuses`` (comma-separated, in that order),
+    following every page, and keeps plans created in the last ``days`` days; a plan
+    listed under two statuses appears once. Or pass ``plan_ids`` (comma-separated)
+    to read just those plans, with no listing. AWD plans (GetInboundPlan answers 400)
+    are skipped and counted. Never partial: any other failure is an error.
+
+    Returns {"plans": [{plan_id, status, created_at, shipments: [{shipment_id,
+    status, confirmation_id, destination}]}], "pages", "skipped"}.
+    """
+    from sp_api.api import FulfillmentInboundV20240320 as G
+    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+    if plan_ids:
+        ids = [x.strip() for x in plan_ids.split(",") if x.strip()]
+        return {"plans": [_inbound_plan(g, pid) for pid in ids], "pages": 0, "skipped": 0}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    plans, seen, pages, skipped = [], set(), 0, 0
+    for status in [x.strip().upper() for x in statuses.split(",") if x.strip()]:
+        token, tokens = None, set()
+        while True:
+            kw = {"pageSize": 30, "status": status}
+            if token:
+                kw["paginationToken"] = token
+            resp = _with_retry(lambda: g.list_inbound_plans(**kw), max_attempts=_PATIENT)
+            pages += 1
+            for p in (resp.payload or {}).get("inboundPlans") or []:
+                pid = p.get("inboundPlanId")
+                created = p.get("createdAt")
+                if not pid or pid in seen:
+                    continue
+                if created and datetime.fromisoformat(created.replace("Z", "+00:00")) < cutoff:
+                    continue
+                seen.add(pid)
+                try:
+                    plans.append(_inbound_plan(g, pid, created))
+                except SellingApiException as e:
+                    if getattr(e, "code", None) != 400:
+                        raise
+                    skipped += 1  # AWD plan: GetInboundPlan does not support it
+            # The library hoists `pagination` off .payload; next_token reads both.
+            token = resp.next_token
+            if not token:
+                break
+            if token in tokens:
+                raise RuntimeError(f"pagination token repeated for status {status}")
+            tokens.add(token)
+    return {"plans": plans, "pages": pages, "skipped": skipped}
+
+
+@mcp.tool()
+@tool_safe
+def get_inbound_shipment_items(plan_id: str, shipment_id: str,
+                               confirmation_id: str = None) -> dict:
+    """Items of one inbound shipment with shipped AND received quantities (read-only).
+
+    v2024-03-20 has only the shipped quantity, so items come from Fulfillment
+    Inbound v0 getShipmentItemsByShipmentId, keyed by the shipment confirmation id
+    (FBA...; see get_inbound_plans). With no confirmation id, or when the v0 read
+    fails, it falls back to v2024 listShipmentItems (every page) with received 0.
+
+    Returns {"items": [{msku, shipped, received}], "source": "v0" | "v2024"} and,
+    after a fallback, "v0_error".
+    """
+    err = "no confirmation id"
+    if confirmation_id:
+        from sp_api.api import FulfillmentInbound as V0
+        v0 = V0(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+        try:
+            data = (_with_retry(lambda: v0.shipment_items_by_shipment(confirmation_id),
+                                max_attempts=_PATIENT).payload) or {}
+            return {"items": [{"msku": i["SellerSKU"], "shipped": int(i["QuantityShipped"]),
+                               "received": int(i["QuantityReceived"])}
+                              for i in data.get("ItemData") or []],
+                    "source": "v0"}
+        except Exception as e:  # noqa: BLE001 - any v0 failure falls back to v2024
+            err = f"{type(e).__name__}: {e}"[:300]
+    from sp_api.api import FulfillmentInboundV20240320 as G
+    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+    items, token, tokens = [], None, set()
+    while True:
+        kw = {"inboundPlanId": plan_id, "shipmentId": shipment_id}
+        if token:
+            kw["paginationToken"] = token
+        resp = _with_retry(lambda: g.list_shipment_items(**kw), max_attempts=_PATIENT)
+        items += [{"msku": i["msku"], "shipped": int(i["quantity"]), "received": 0}
+                  for i in (resp.payload or {}).get("items") or []]
+        token = resp.next_token
+        if not token:
+            break
+        if token in tokens:
+            raise RuntimeError("pagination token repeated")
+        tokens.add(token)
+    return {"items": items, "source": "v2024", "v0_error": err}
+
+
+@mcp.tool()
+@tool_safe
+def get_product_pricing_for_skus(skus: str) -> dict:
+    """Your own offer's price for up to 20 seller SKUs (Product Pricing v0
+    getPricing, ItemType=Sku; read-only). ``skus`` is comma-separated.
+
+    Returns {"pricing": [...]}: one entry per SKU with ``status`` and, on
+    "Success", ``Product.Offers[].BuyingPrice`` (ListingPrice, LandedPrice).
+    """
+    from sp_api.api import Products
+    lst = [x.strip() for x in skus.split(",") if x.strip()]
+    if not 1 <= len(lst) <= 20:
+        raise ValueError(f"pass 1 to 20 SKUs, got {len(lst)}")
+    resp = _with_retry(lambda: Products(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+                       .get_product_pricing_for_skus(lst), max_attempts=_PATIENT)
+    return {"pricing": resp.payload if isinstance(resp.payload, list) else []}
+
+
+@mcp.tool()
+@tool_safe
+def get_listings_item(seller_id: str, sku: str, included_data: str = "summaries,offers") -> dict:
+    """One of your listings by seller SKU (Listings Items 2021-08-01; read-only).
+
+    ``seller_id`` is your merchant token. ``included_data`` is a comma list of
+    summaries, attributes, issues, offers, fulfillmentAvailability, procurement.
+    Returns the listing payload as Amazon sends it.
+    """
+    from sp_api.api import ListingsItems
+    inc = ",".join(x.strip() for x in included_data.split(",") if x.strip())
+    resp = _with_retry(lambda: ListingsItems(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+                       .get_listings_item(sellerId=seller_id, sku=sku,
+                                          marketplaceIds=[MARKETPLACE], includedData=inc),
+                       max_attempts=_PATIENT)
+    return resp.payload or {}
+
+
 # --- Entrypoint ---------------------------------------------------------------
 
 if __name__ == "__main__":

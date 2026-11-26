@@ -23,6 +23,7 @@ Both **Claude Code** and **Codex** connect to the same URL, from any device
 | Sales           | `get_sales_metrics`, `get_sales_traffic_report`                                                                                 |
 | Finance / fees  | `get_settlement_report`, `get_fba_reimbursements`, `get_fba_storage_fees`, `get_fba_long_term_storage_fees`, `get_fee_estimate` |
 | Catalog         | `get_catalog_item`, `search_catalog`                                                                                            |
+| Inbound, prices | `get_inbound_plans`, `get_inbound_shipment_items` (received qty), `get_product_pricing_for_skus`, `get_listings_item`            |
 
 Report-backed tools (settlement, reimbursements, storage fees, ledger, traffic)
 use the SP-API async Reports flow: request → poll → download.
