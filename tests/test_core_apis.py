@@ -282,3 +282,29 @@ async def test_throttle_429_is_retried_on_paginated_calls(api):
     res = await call("get_orders")
     assert route.call_count == 2
     assert res["count"] == 1
+
+
+# --- pricing / listings ----------------------------------------------------------
+
+async def test_product_pricing_for_skus(api):
+    route = api.get(f"{EU}/products/pricing/v0/price").mock(return_value=ok({"payload": [
+        {"status": "Success", "SellerSKU": "SKU1", "Product": {"Offers": []}}]}))
+    res = await call("get_product_pricing_for_skus", skus="SKU1, SKU2")
+    assert res["pricing"][0]["SellerSKU"] == "SKU1"
+    p = params(route)
+    assert p["ItemType"] == ["Sku"] and p["MarketplaceId"] == [MP]
+    assert p["Skus"] in (["SKU1,SKU2"], ["SKU1", "SKU2"])
+
+
+async def test_product_pricing_rejects_more_than_20(api):
+    res = await call("get_product_pricing_for_skus", skus=",".join(f"S{i}" for i in range(21)))
+    assert "20" in res["error"]["message"]
+
+
+async def test_listings_item_offers(api):
+    route = api.get(f"{EU}/listings/2021-08-01/items/SELLER1/SKU1").mock(return_value=ok(
+        {"sku": "SKU1", "offers": [{"price": {"currencyCode": "INR", "amount": "10.00"}}]}))
+    res = await call("get_listings_item", seller_id="SELLER1", sku="SKU1", included_data="offers")
+    assert res["offers"][0]["price"]["amount"] == "10.00"
+    p = params(route)
+    assert p["includedData"] == ["offers"] and p["marketplaceIds"] == [MP]
