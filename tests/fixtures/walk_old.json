@@ -1,0 +1,520 @@
+[
+ {
+  "tool": "get_inbound_plans",
+  "args": {},
+  "result": {
+   "plans": [
+    {
+     "plan_id": "PA",
+     "status": "ACTIVE",
+     "created_at": "2099-03-01T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SA1",
+       "status": "WORKING",
+       "confirmation_id": "FBASA1",
+       "destination": "ISK3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PB",
+     "status": "ACTIVE",
+     "created_at": "2099-03-02T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SB1",
+       "status": "READY_TO_SHIP",
+       "confirmation_id": "FBASB1",
+       "destination": "BLR4"
+      },
+      {
+       "shipment_id": "SB2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASB2",
+       "destination": "DED3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PC",
+     "status": "ACTIVE",
+     "created_at": "2099-02-20T10:00:00Z",
+     "shipments": []
+    },
+    {
+     "plan_id": "PD",
+     "status": "ACTIVE",
+     "created_at": "2099-02-18T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SD1",
+       "status": "CANCELLED",
+       "confirmation_id": "FBASD1",
+       "destination": "NAX1"
+      }
+     ]
+    },
+    {
+     "plan_id": "PE",
+     "status": "ACTIVE",
+     "created_at": "2099-02-10T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SE1",
+       "status": "READY_TO_SHIP",
+       "confirmation_id": null,
+       "destination": "DED5"
+      }
+     ]
+    },
+    {
+     "plan_id": "PG",
+     "status": "ACTIVE",
+     "created_at": "2099-01-20T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SG1",
+       "status": "RECEIVING",
+       "confirmation_id": "FBASG1",
+       "destination": "BLR4"
+      }
+     ]
+    },
+    {
+     "plan_id": "PH",
+     "status": "ACTIVE",
+     "created_at": "2099-01-15T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SH1",
+       "status": "CLOSED",
+       "confirmation_id": "FBASH1",
+       "destination": "DED5"
+      },
+      {
+       "shipment_id": "SH2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASH2",
+       "destination": "DED5"
+      }
+     ]
+    },
+    {
+     "plan_id": "PI",
+     "status": "ACTIVE",
+     "created_at": "2099-01-10T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SI1",
+       "status": "DELIVERED",
+       "confirmation_id": "FBASI1",
+       "destination": "ISK3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PJ",
+     "status": "ACTIVE",
+     "created_at": "2099-01-05T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SJ1",
+       "status": "CHECKED_IN",
+       "confirmation_id": "FBASJ1",
+       "destination": "NAX1"
+      },
+      {
+       "shipment_id": "SJ2",
+       "status": "CLOSED",
+       "confirmation_id": "FBASJ2",
+       "destination": "NAX1"
+      }
+     ]
+    }
+   ],
+   "pages": 6,
+   "skipped": 1
+  }
+ },
+ {
+  "tool": "get_inbound_plans",
+  "args": {
+   "statuses": "ACTIVE,SHIPPED",
+   "days": 120
+  },
+  "result": {
+   "plans": [
+    {
+     "plan_id": "PA",
+     "status": "ACTIVE",
+     "created_at": "2099-03-01T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SA1",
+       "status": "WORKING",
+       "confirmation_id": "FBASA1",
+       "destination": "ISK3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PB",
+     "status": "ACTIVE",
+     "created_at": "2099-03-02T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SB1",
+       "status": "READY_TO_SHIP",
+       "confirmation_id": "FBASB1",
+       "destination": "BLR4"
+      },
+      {
+       "shipment_id": "SB2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASB2",
+       "destination": "DED3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PC",
+     "status": "ACTIVE",
+     "created_at": "2099-02-20T10:00:00Z",
+     "shipments": []
+    },
+    {
+     "plan_id": "PD",
+     "status": "ACTIVE",
+     "created_at": "2099-02-18T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SD1",
+       "status": "CANCELLED",
+       "confirmation_id": "FBASD1",
+       "destination": "NAX1"
+      }
+     ]
+    },
+    {
+     "plan_id": "PE",
+     "status": "ACTIVE",
+     "created_at": "2099-02-10T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SE1",
+       "status": "READY_TO_SHIP",
+       "confirmation_id": null,
+       "destination": "DED5"
+      }
+     ]
+    },
+    {
+     "plan_id": "PG",
+     "status": "ACTIVE",
+     "created_at": "2099-01-20T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SG1",
+       "status": "RECEIVING",
+       "confirmation_id": "FBASG1",
+       "destination": "BLR4"
+      }
+     ]
+    },
+    {
+     "plan_id": "PH",
+     "status": "ACTIVE",
+     "created_at": "2099-01-15T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SH1",
+       "status": "CLOSED",
+       "confirmation_id": "FBASH1",
+       "destination": "DED5"
+      },
+      {
+       "shipment_id": "SH2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASH2",
+       "destination": "DED5"
+      }
+     ]
+    },
+    {
+     "plan_id": "PI",
+     "status": "ACTIVE",
+     "created_at": "2099-01-10T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SI1",
+       "status": "DELIVERED",
+       "confirmation_id": "FBASI1",
+       "destination": "ISK3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PJ",
+     "status": "ACTIVE",
+     "created_at": "2099-01-05T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SJ1",
+       "status": "CHECKED_IN",
+       "confirmation_id": "FBASJ1",
+       "destination": "NAX1"
+      },
+      {
+       "shipment_id": "SJ2",
+       "status": "CLOSED",
+       "confirmation_id": "FBASJ2",
+       "destination": "NAX1"
+      }
+     ]
+    }
+   ],
+   "pages": 6,
+   "skipped": 1
+  }
+ },
+ {
+  "tool": "get_inbound_plans",
+  "args": {
+   "plan_ids": "PG,PB,PH"
+  },
+  "result": {
+   "plans": [
+    {
+     "plan_id": "PG",
+     "status": "ACTIVE",
+     "created_at": "2099-01-20T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SG1",
+       "status": "RECEIVING",
+       "confirmation_id": "FBASG1",
+       "destination": "BLR4"
+      }
+     ]
+    },
+    {
+     "plan_id": "PB",
+     "status": "ACTIVE",
+     "created_at": "2099-03-02T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SB1",
+       "status": "READY_TO_SHIP",
+       "confirmation_id": "FBASB1",
+       "destination": "BLR4"
+      },
+      {
+       "shipment_id": "SB2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASB2",
+       "destination": "DED3"
+      }
+     ]
+    },
+    {
+     "plan_id": "PH",
+     "status": "ACTIVE",
+     "created_at": "2099-01-15T10:00:00Z",
+     "shipments": [
+      {
+       "shipment_id": "SH1",
+       "status": "CLOSED",
+       "confirmation_id": "FBASH1",
+       "destination": "DED5"
+      },
+      {
+       "shipment_id": "SH2",
+       "status": "IN_TRANSIT",
+       "confirmation_id": "FBASH2",
+       "destination": "DED5"
+      }
+     ]
+    }
+   ],
+   "pages": 0,
+   "skipped": 0
+  }
+ },
+ {
+  "tool": "get_confirmed_inbound_pickups",
+  "args": {},
+  "result": {
+   "shipments": [
+    {
+     "plan_id": "PB",
+     "shipment_id": "SB1",
+     "confirmation_id": "FBASB1",
+     "status": "READY_TO_SHIP",
+     "fc": "BLR4",
+     "transportation_option_id": "TO-SB1",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    },
+    {
+     "plan_id": "PB",
+     "shipment_id": "SB2",
+     "confirmation_id": "FBASB2",
+     "status": "READY_TO_SHIP",
+     "fc": "DED3",
+     "transportation_option_id": "TO-SB2",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    }
+   ],
+   "plans_scanned": 5,
+   "pages": 3,
+   "skipped": 1
+  }
+ },
+ {
+  "tool": "get_confirmed_inbound_pickups",
+  "args": {
+   "fcs": "ISK3,BLR4,DED5,NAX1",
+   "statuses": "WORKING,READY_TO_SHIP,IN_TRANSIT,SHIPPED,CANCELLED"
+  },
+  "result": {
+   "shipments": [
+    {
+     "plan_id": "PA",
+     "shipment_id": "SA1",
+     "confirmation_id": "FBASA1",
+     "status": "WORKING",
+     "fc": "ISK3",
+     "transportation_option_id": "TO-SA1",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    },
+    {
+     "plan_id": "PB",
+     "shipment_id": "SB1",
+     "confirmation_id": "FBASB1",
+     "status": "READY_TO_SHIP",
+     "fc": "BLR4",
+     "transportation_option_id": "TO-SB1",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    },
+    {
+     "plan_id": "PD",
+     "shipment_id": "SD1",
+     "confirmation_id": "FBASD1",
+     "status": "CANCELLED",
+     "fc": "NAX1",
+     "transportation_option_id": "TO-SD1",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    },
+    {
+     "plan_id": "PE",
+     "shipment_id": "SE1",
+     "confirmation_id": null,
+     "status": "WORKING",
+     "fc": "DED5",
+     "transportation_option_id": "TO-SE1",
+     "carrier": "ATSP",
+     "shipping_solution": "AMAZON_PARTNERED_CARRIER",
+     "appt_start": "2099-03-10T04:30:00Z",
+     "appt_end": "2099-03-10T07:45:00Z",
+     "voidable_until": "2099-03-09T00:00:00Z",
+     "cost_inr": 450.0
+    }
+   ],
+   "plans_scanned": 5,
+   "pages": 3,
+   "skipped": 1
+  }
+ },
+ {
+  "tool": "get_inbound_by_fc",
+  "args": {},
+  "result": {
+   "rows": [
+    {
+     "fc": "BLR4",
+     "sku": "M1",
+     "qty": 16
+    },
+    {
+     "fc": "BLR4",
+     "sku": "M2",
+     "qty": 7
+    },
+    {
+     "fc": "BLR4",
+     "sku": "M5",
+     "qty": 7
+    },
+    {
+     "fc": "DED3",
+     "sku": "M3",
+     "qty": 8
+    },
+    {
+     "fc": "DED5",
+     "sku": "M2",
+     "qty": 12
+    },
+    {
+     "fc": "DED5",
+     "sku": "MX",
+     "qty": 1
+    },
+    {
+     "fc": "ISK3",
+     "sku": "M1",
+     "qty": 10
+    },
+    {
+     "fc": "ISK3",
+     "sku": "M3",
+     "qty": 2
+    },
+    {
+     "fc": "NAX1",
+     "sku": "M6",
+     "qty": 4
+    }
+   ],
+   "plans": 13,
+   "shipments": 8,
+   "skipped_awd_plans": 1,
+   "by_status": {
+    "WORKING": 11,
+    "READY_TO_SHIP": 18,
+    "CANCELLED": 0,
+    "RECEIVING": 20,
+    "CLOSED": 0,
+    "IN_TRANSIT": 12,
+    "DELIVERED": 2,
+    "CHECKED_IN": 4
+   },
+   "total": 67
+  }
+ }
+]

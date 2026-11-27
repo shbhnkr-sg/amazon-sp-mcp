@@ -46,6 +46,13 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr(server.time, "sleep", lambda s: None)
 
 
+@pytest.fixture(autouse=True)
+def fresh_caches():
+    """The terminal-shipment caches live for the process; each test starts empty."""
+    for name in ("_SHIPMENT_CACHE", "_TRANSPORT_CACHE"):
+        getattr(server, name, {}).clear()
+
+
 @pytest.fixture
 def doc_host():
     """Real local HTTP server standing in for the presigned S3 report-document URL

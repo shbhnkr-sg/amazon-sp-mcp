@@ -52,7 +52,17 @@ All tools are bounded and consistent so responses stay within an agent's token b
   settlement report (Amazon generates these; they can't be requested on demand).
 - **Errors** are always `{ "error": { "type", "code", "message" } }` — never a raw
   500 — so a throttle, bad input, or not-found is distinguishable.
-- **Throttling:** every SP-API call retries 429/5xx with exponential backoff.
+- **Throttling:** every SP-API call retries 5xx with exponential backoff. The inbound,
+  report and pricing operations also share one token bucket per operation across every
+  caller and tool call (`RATE_LIMITS` in `server.py`, the documented default usage plans);
+  a 429 drains that bucket and is retried for up to 120 s of backoff rather than failing.
+- **Inbound walks** (`get_inbound_plans`, `get_inbound_by_fc`, `get_confirmed_inbound_pickups`)
+  read plans and shipments concurrently and return them in listing order. Shipments in a
+  terminal state (CLOSED, CANCELLED, DELETED) are read once per process and then served
+  from memory; a restart (every deploy) starts the cache empty, which costs one full walk.
+- **`get_inbound_by_fc`** counts shipped - received (v0) per item for shipments whose
+  transport is confirmed (WORKING is excluded by default), over plans created in the last
+  120 days: the same rules as fba-planner's `ship_agent/inbound.py`.
 
 ## Credentials
 

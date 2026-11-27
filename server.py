@@ -1,11 +1,15 @@
+import asyncio
 import gzip
+import inspect
 import json
 import logging
 import os
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from functools import partial, wraps
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -87,27 +91,95 @@ def _iso(dt):
 
 # --- Shared helpers (retry, pagination, projection, time windows, errors) ------
 
-def _with_retry(call, *, max_attempts=5, base=1.0):
+class _Bucket:
+    """Token bucket for one SP-API operation, shared by every thread and tool call.
+
+    A caller reserves a token and gets back how long to wait before sending, so the
+    lock is never held while sleeping and no one spins. ``drain`` empties it after a
+    429, so every concurrent caller backs off together."""
+
+    def __init__(self, rate, burst, clock=time.monotonic):
+        self.rate, self.burst, self.clock = rate, burst, clock
+        self.tokens, self.t = float(burst), clock()
+        self.lock = threading.Lock()
+
+    def _refill(self):
+        now = self.clock()
+        self.tokens = min(self.burst, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+
+    def reserve(self):
+        with self.lock:
+            self._refill()
+            self.tokens -= 1
+            return max(0.0, -self.tokens / self.rate)
+
+    def drain(self):
+        with self.lock:
+            self._refill()
+            self.tokens = min(self.tokens, 0.0)
+
+
+# Documented default usage plans (requests/second, burst), developer-docs.amazon/sp-api.
+RATE_LIMITS = {
+    # Fulfillment Inbound v2024-03-20
+    "listInboundPlans": (2, 6),
+    "getInboundPlan": (2, 6),
+    "getShipment": (2, 6),
+    "listShipmentItems": (2, 30),
+    "listTransportationOptions": (2, 6),
+    # Fulfillment Inbound v0
+    "getShipmentItemsByShipmentId": (2, 30),
+    # Reports 2021-06-30
+    "createReport": (0.0167, 15),
+    "getReport": (2, 15),
+    "getReports": (0.0222, 10),
+    "getReportDocument": (0.0167, 15),
+    # Product Pricing v0
+    "getPricing": (0.5, 1),
+}
+_BUCKETS = {op: _Bucket(r, b) for op, (r, b) in RATE_LIMITS.items()}
+# A 429 is retried until this much backoff has been spent (it never counts toward
+# max_attempts): under the 240 s probe and 300 s pipeline socket timeouts.
+_THROTTLE_BUDGET = 120
+_THROTTLE_CAP = 30
+
+
+def _with_retry(call, *, max_attempts=5, base=1.0, op=None):
     """Invoke an SP-API thunk, retrying throttle/5xx/transient errors with backoff.
 
-    The library has no built-in retry. We retry on HTTP 429/5xx (read off the
-    exception's ``code``) and transient transport/JSON errors; everything else
-    (4xx, bad input) is re-raised immediately.
+    ``op`` names the SP-API operation: each attempt first takes a token from its
+    bucket (RATE_LIMITS). A 429 drains the bucket and is retried with backoff (capped
+    at _THROTTLE_CAP s) until _THROTTLE_BUDGET s of backoff is spent. 5xx and
+    transient transport/JSON errors are retried up to ``max_attempts``; everything
+    else (4xx, bad input) is re-raised immediately.
     """
-    for attempt in range(max_attempts):
+    bucket = _BUCKETS.get(op)
+    attempt, throttles, waited = 0, 0, 0.0
+    while True:
+        if bucket:
+            wait = bucket.reserve()
+            if wait:
+                time.sleep(wait)
         try:
             return call()
         except Exception as e:
-            last = attempt == max_attempts - 1
-            if isinstance(e, SellingApiException):
-                retryable = getattr(e, "code", None) in _RETRY_CODES
-            elif isinstance(e, _RETRY_NETWORK):
-                retryable = True
-            else:
-                retryable = False
-            if not retryable or last:
+            code = getattr(e, "code", None) if isinstance(e, SellingApiException) else None
+            if code == 429:
+                if bucket:
+                    bucket.drain()
+                delay = min(_THROTTLE_CAP, base * (2 ** throttles))
+                if waited + delay > _THROTTLE_BUDGET:
+                    raise
+                throttles, waited = throttles + 1, waited + delay
+                time.sleep(delay)
+                continue
+            attempt += 1
+            retryable = code in _RETRY_CODES or (
+                not isinstance(e, SellingApiException) and isinstance(e, _RETRY_NETWORK))
+            if not retryable or attempt >= max_attempts:
                 raise
-            time.sleep(base * (2 ** attempt))
+            time.sleep(base * (2 ** (attempt - 1)))
 
 
 def _paginate(call, items_key, get_token, *, max_items=200, max_pages=20):
@@ -163,23 +235,37 @@ def _window(days_ago=None, after=None, before=None, *, floor_to_day=False,
     return _iso(start.astimezone(timezone.utc)), _iso(end.astimezone(timezone.utc))
 
 
+def _error_envelope(fn, e):
+    if isinstance(e, SellingApiException):
+        return {"error": {"type": type(e).__name__,
+                          "code": getattr(e, "code", None), "message": str(e)}}
+    log.exception("tool %s failed", fn.__name__)
+    return {"error": {"type": type(e).__name__, "message": str(e)}}
+
+
 def tool_safe(fn):
-    """Wrap a tool so any exception becomes a structured error envelope.
+    """Wrap a tool (sync or async) so any exception becomes a structured error envelope.
 
     Catches everything (not just SellingApiException, so KeyError/httpx/JSON no
     longer escape as raw 500s) and logs unexpected failures server-side so real
     bugs aren't silently swallowed. Keep ``@mcp.tool()`` above this decorator.
     """
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def awrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - deliberate catch-all for tool safety
+                return _error_envelope(fn, e)
+
+        return awrapper
+
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except SellingApiException as e:
-            return {"error": {"type": type(e).__name__,
-                              "code": getattr(e, "code", None), "message": str(e)}}
         except Exception as e:  # noqa: BLE001 - deliberate catch-all for tool safety
-            log.exception("tool %s failed", fn.__name__)
-            return {"error": {"type": type(e).__name__, "message": str(e)}}
+            return _error_envelope(fn, e)
 
     return wrapper
 
@@ -406,7 +492,7 @@ def _poll_report(r, report_id, *, attempts=10, delay=4):
     (always carrying reportId so a caller can re-fetch with report_id=...).
     """
     for _ in range(attempts):
-        status = (_with_retry(lambda: r.get_report(report_id)).payload) or {}
+        status = (_with_retry(lambda: r.get_report(report_id), op="getReport").payload) or {}
         ps = status.get("processingStatus")
         if ps == "DONE":
             doc_id = status.get("reportDocumentId")
@@ -414,7 +500,8 @@ def _poll_report(r, report_id, *, attempts=10, delay=4):
                 return {"error": {"type": "ReportError",
                                   "message": "report DONE but no reportDocumentId",
                                   "reportId": report_id}}
-            return (_with_retry(lambda: r.get_report_document(doc_id)).payload) or {}
+            return (_with_retry(lambda: r.get_report_document(doc_id),
+                                op="getReportDocument").payload) or {}
         if ps == "CANCELLED":
             # Amazon cancels reports with no records for the period — treat as empty, not an error.
             return {"status": "NO_DATA", "reportId": report_id,
@@ -444,7 +531,7 @@ def _request_and_fetch_report(report_type, days_ago=30, after=None, before=None,
                 "dataStartTime": start, "dataEndTime": end}
         if extra_options:
             opts.update(extra_options)
-        created = (_with_retry(lambda: r.create_report(**opts)).payload) or {}
+        created = (_with_retry(lambda: r.create_report(**opts), op="createReport").payload) or {}
         report_id = created.get("reportId")
         if not report_id:
             return {"error": {"type": "ReportError",
@@ -464,7 +551,7 @@ def _latest_settlement_report(max_rows=500, fields=None):
     """
     r = Reports(credentials=creds(), marketplace=MARKETPLACE_ENUM)
     listing = (_with_retry(lambda: r.get_reports(
-        reportTypes=["GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE"])).payload) or {}
+        reportTypes=["GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE"]), op="getReports").payload) or {}
     done = [x for x in listing.get("reports", [])
             if x.get("processingStatus") == "DONE" and x.get("reportDocumentId")]
     if not done:
@@ -472,7 +559,7 @@ def _latest_settlement_report(max_rows=500, fields=None):
                           "message": "no settlement reports available yet"}}
     latest = max(done, key=lambda x: x.get("dataEndTime", ""))
     doc = (_with_retry(lambda: r.get_report_document(
-        latest["reportDocumentId"])).payload) or {}
+        latest["reportDocumentId"]), op="getReportDocument").payload) or {}
     result = _cap_report(_extract_report_text(doc),
                          "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE", max_rows, fields)
     result["reportId"] = latest.get("reportId")
@@ -577,90 +664,259 @@ def get_report(report_type: str, days_ago: int = 30, after: str = None, before: 
                                      max_rows=max_rows, fields=fields, report_id=report_id)
 
 
-@mcp.tool()
-@tool_safe
-def get_inbound_by_fc(statuses: str = "WORKING,READY_TO_SHIP,SHIPPED,IN_TRANSIT,DELIVERED,CHECKED_IN,RECEIVING",
-                      max_plans: int = 200) -> dict:
-    """Inbound units broken down by DESTINATION fulfilment centre and SKU.
+# --- Inbound walks (Fulfillment Inbound v2024-03-20) --------------------------
+# Read-only. The walks retry 5xx up to 7 attempts (a planner reading every shipment
+# has no use for a partial answer); 429s are paced by the buckets and retried on
+# their own budget. Per-plan and per-shipment reads run concurrently in threads
+# (the SP-API client is sync), results reassembled in listing order.
 
-    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20), reads each
-    shipment's destination.warehouseId, and sums its line items. This is what
-    replenishment planning needs: the per-SKU inbound totals in the MYI report
-    are national and cannot say which FC the stock is heading to.
+_PATIENT = 7
+_PLAN_FANOUT = 6  # plans read at once: the getInboundPlan burst
+_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="sp-api")
+IN_TRANSIT_STATUSES = "READY_TO_SHIP,SHIPPED,IN_TRANSIT,DELIVERED,CHECKED_IN,RECEIVING"
+_TERMINAL = {"CLOSED", "CANCELLED", "DELETED"}
+# Shipments in a terminal state never change, so each is read once per process:
+# getShipment payloads keyed (plan_id, shipment_id), selected transportation options
+# keyed (plan_id, shipment_id, option_id). In memory only: a restart (every deploy)
+# starts empty and the next walk re-reads them, so correctness never depends on it.
+_SHIPMENT_CACHE: dict = {}
+_TRANSPORT_CACHE: dict = {}
 
-    Returns {"rows": [{fc, sku, qty, status}], "plans": n, "shipments": n,
-    "skipped_awd_plans": n, "by_status": {...}, "total": n}. AWD (Amazon
-    Warehousing and Distribution) plans can't be read by this API and are skipped.
-    """
+
+def _inbound():
+    """A fresh v2024 client: sp_api clients keep per-request state, so threads never share one."""
     from sp_api.api import FulfillmentInboundV20240320 as G
-    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
-    want = {s.strip().upper() for s in statuses.split(",") if s.strip()}
+    return G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
 
-    plans, token, pages = [], None, 0
-    while pages < 20:
-        pages += 1
-        kw = {"pageSize": 30}
+
+async def _io(fn, *args):
+    """Run one blocking SP-API read in the walk pool."""
+    return await asyncio.get_running_loop().run_in_executor(_POOL, partial(fn, *args))
+
+
+def _ts(v):
+    """An ISO timestamp as an aware datetime, or None."""
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _list_page(kw, attempts):
+    return _with_retry(lambda: _inbound().list_inbound_plans(**kw),
+                       max_attempts=attempts, op="listInboundPlans")
+
+
+def _get_plan(pid, attempts):
+    return (_with_retry(lambda: _inbound().get_inbound_plan(inboundPlanId=pid),
+                        max_attempts=attempts, op="getInboundPlan").payload) or {}
+
+
+def _get_shipment(pid, sid, attempts):
+    """getShipment's payload; a terminal shipment's comes from the cache after its first read."""
+    hit = _SHIPMENT_CACHE.get((pid, sid))
+    if hit is not None:
+        return hit
+    full = (_with_retry(lambda: _inbound().get_shipment(inboundPlanId=pid, shipmentId=sid),
+                        max_attempts=attempts, op="getShipment").payload) or {}
+    if (full.get("status") or "").upper() in _TERMINAL:
+        _SHIPMENT_CACHE[(pid, sid)] = full
+    return full
+
+
+async def _walk(statuses, cutoff, read, *, max_plans=None, attempts=_PATIENT):
+    """List plans (each status in order, every page, newest update first) and read each.
+
+    A plan listed twice is read once; one created before ``cutoff`` is left out. Paging
+    stops after a page holding a plan last updated before ``cutoff``: the listing is
+    sorted by last update, and a plan is never updated before it was created, so every
+    later plan is outside the window too. ``read(pid, created_at)`` runs concurrently
+    (at most _PLAN_FANOUT at once) while the listing continues; returns (results in
+    listing order, pages). ``statuses`` of [None] lists without a status filter.
+    """
+    sem = asyncio.Semaphore(_PLAN_FANOUT)
+
+    async def bounded(pid, created):
+        async with sem:
+            return await read(pid, created)
+
+    tasks, seen, pages = [], set(), 0
+    try:
+        for status in statuses:
+            token, tokens = None, set()
+            while True:
+                kw = {"pageSize": 30, "sortBy": "LAST_UPDATED_TIME", "sortOrder": "DESC"}
+                if status:
+                    kw["status"] = status
+                if token:
+                    kw["paginationToken"] = token
+                resp = await _io(_list_page, kw, attempts)
+                pages += 1
+                stale = False
+                for p in (resp.payload or {}).get("inboundPlans") or []:
+                    updated = _ts(p.get("lastUpdatedAt"))
+                    stale = stale or bool(updated and updated < cutoff)
+                    pid, created = p.get("inboundPlanId"), p.get("createdAt")
+                    if not pid or pid in seen:
+                        continue
+                    born = _ts(created) if created else None
+                    if born and born < cutoff:
+                        continue
+                    if max_plans is not None and len(seen) >= max_plans:
+                        stale = True
+                        break
+                    seen.add(pid)
+                    tasks.append(asyncio.ensure_future(bounded(pid, created)))
+                # The library hoists `pagination` off .payload; next_token reads both.
+                token = resp.next_token
+                if not token or stale:
+                    break
+                if token in tokens:
+                    raise RuntimeError(f"pagination token repeated for status {status}")
+                tokens.add(token)
+        return list(await asyncio.gather(*tasks)), pages
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _shipment_items(plan_id, shipment_id, confirmation_id=None):
+    """{"items": [{msku, shipped, received}], "source"} (see get_inbound_shipment_items)."""
+    err = "no confirmation id"
+    if confirmation_id:
+        from sp_api.api import FulfillmentInbound as V0
+        v0 = V0(credentials=creds(), marketplace=MARKETPLACE_ENUM)
+        try:
+            data = (_with_retry(lambda: v0.shipment_items_by_shipment(confirmation_id),
+                                max_attempts=_PATIENT,
+                                op="getShipmentItemsByShipmentId").payload) or {}
+            return {"items": [{"msku": i["SellerSKU"], "shipped": int(i["QuantityShipped"]),
+                               "received": int(i["QuantityReceived"])}
+                              for i in data.get("ItemData") or []],
+                    "source": "v0"}
+        except Exception as e:  # noqa: BLE001 - any v0 failure falls back to v2024
+            err = f"{type(e).__name__}: {e}"[:300]
+    g = _inbound()
+    items, token, tokens = [], None, set()
+    while True:
+        kw = {"inboundPlanId": plan_id, "shipmentId": shipment_id}
         if token:
             kw["paginationToken"] = token
-        resp = _with_retry(lambda: g.list_inbound_plans(**kw))
-        plans.extend((resp.payload or {}).get("inboundPlans") or [])
-        # The library hoists `pagination` off .payload onto the response object.
-        token = (getattr(resp, "pagination", None) or {}).get("nextToken")
-        if not token or len(plans) >= max_plans:
+        resp = _with_retry(lambda: g.list_shipment_items(**kw), max_attempts=_PATIENT,
+                           op="listShipmentItems")
+        items += [{"msku": i["msku"], "shipped": int(i["quantity"]), "received": 0}
+                  for i in (resp.payload or {}).get("items") or [] if i.get("msku")]
+        token = resp.next_token
+        if not token:
             break
+        if token in tokens:
+            raise RuntimeError("pagination token repeated")
+        tokens.add(token)
+    return {"items": items, "source": "v2024", "v0_error": err}
 
-    agg, by_status, nship, awd = {}, {}, 0, 0
-    for p in plans[:max_plans]:
-        pid = p.get("inboundPlanId")
-        if not pid:
-            continue
+
+@mcp.tool()
+@tool_safe
+async def get_inbound_by_fc(statuses: str = IN_TRANSIT_STATUSES, max_plans: int = 200) -> dict:
+    """Inbound units still in transit, broken down by DESTINATION fulfilment centre and SKU.
+
+    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20) created in the last
+    120 days, reads each shipment's status and destination.warehouseId, and for
+    shipments whose status is in ``statuses`` (default: transport confirmed, so
+    WORKING is left out) sums shipped - received per item, floored at 0. Received
+    comes from Fulfillment Inbound v0 (as get_inbound_shipment_items; without a
+    confirmation id it is 0). These are fba-planner ship_agent/inbound.py's rules.
+    FC codes are raw (a DED3 shipment is DED3) and the planner's scratch drafts are
+    not known here. The per-SKU inbound totals in the MYI report are national and
+    cannot say which FC the stock is heading to.
+
+    Returns {"rows": [{fc, sku, qty}], "plans": n, "shipments": n,
+    "skipped_awd_plans": n, "by_status": {status: units}, "total": n}. AWD (Amazon
+    Warehousing and Distribution) plans can't be read by this API and are skipped.
+    """
+    want = {s.strip().upper() for s in statuses.split(",") if s.strip()}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=120)
+
+    async def shipment(pid, sh):
+        sid, st = sh.get("shipmentId"), (sh.get("status") or "").upper()
+        if not sid:
+            return None
+        if st not in want and st in _TERMINAL:
+            return st, None, None  # listed terminal: it never changes, nothing to read
+        full = await _io(_get_shipment, pid, sid, _PATIENT)
+        st = (full.get("status") or st).upper()
+        if st not in want:
+            return st, None, None
+        fc = ((full.get("destination") or {}).get("warehouseId")) or "UNKNOWN"
+        got = await _io(_shipment_items, pid, sid, full.get("shipmentConfirmationId"))
+        return st, fc, got["items"]
+
+    async def read(pid, _created):
         try:
-            det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid)).payload) or {}
+            det = await _io(_get_plan, pid, _PATIENT)
         except SellingApiException as e:
             # AWD inbound plans appear in the list but can't be fetched by this API.
             if "Amazon Warehousing and Distribution" not in str(e):
                 raise
-            awd += 1
-            continue
-        for sh in (det.get("shipments") or []):
-            st = (sh.get("status") or "").upper()
+            return None
+        return await asyncio.gather(*(shipment(pid, sh) for sh in det.get("shipments") or []))
+
+    plans, _pages = await _walk([None], cutoff, read, max_plans=max_plans)
+    agg, by_status, nship = {}, {}, 0
+    for ships in plans:
+        for rec in ships or []:
+            if rec is None:
+                continue
+            st, fc, items = rec
             by_status[st] = by_status.get(st, 0)
-            if st not in want:
+            if items is None:
                 continue
-            sid = sh.get("shipmentId")
-            if not sid:
-                continue
-            full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid)).payload) or {}
-            fc = ((full.get("destination") or {}).get("warehouseId")) or "UNKNOWN"
             nship += 1
-            itok, ip = None, 0
-            while ip < 20:
-                ip += 1
-                ikw = {"inboundPlanId": pid, "shipmentId": sid}
-                if itok:
-                    ikw["paginationToken"] = itok
-                resp = _with_retry(lambda: g.list_shipment_items(**ikw))
-                res = resp.payload or {}
-                for it in (res.get("items") or []):
-                    sku = it.get("msku")
-                    if not sku:
-                        continue
-                    q = int(it.get("quantity") or 0)
-                    agg[(fc, sku)] = agg.get((fc, sku), 0) + q
-                    by_status[st] = by_status.get(st, 0) + q
-                itok = (getattr(resp, "pagination", None) or {}).get("nextToken")
-                if not itok:
-                    break
+            for it in items:
+                n = max(0, it["shipped"] - it["received"])
+                if n:
+                    agg[(fc, it["msku"])] = agg.get((fc, it["msku"]), 0) + n
+                    by_status[st] += n
 
     rows = [{"fc": fc, "sku": sku, "qty": q} for (fc, sku), q in sorted(agg.items())]
-    return {"rows": rows, "plans": len(plans), "shipments": nship, "skipped_awd_plans": awd,
+    return {"rows": rows, "plans": len(plans), "shipments": nship,
+            "skipped_awd_plans": sum(1 for p in plans if p is None),
             "by_status": by_status, "total": sum(r["qty"] for r in rows)}
+
+
+def _selected_option(pid, sid, sel, terminal):
+    """The shipment's selected transportation option ({} if not listed); cached when terminal."""
+    hit = _TRANSPORT_CACHE.get((pid, sid, sel))
+    if hit is not None:
+        return hit
+    g = _inbound()
+    opt, otok, op = {}, None, 0
+    while op < 10 and not opt:
+        op += 1
+        okw = {"inboundPlanId": pid, "shipmentId": sid}
+        if otok:
+            okw["paginationToken"] = otok
+        r = _with_retry(lambda: g.list_transportation_options(**okw),
+                        op="listTransportationOptions")
+        for o in ((r.payload or {}).get("transportationOptions") or []):
+            if o.get("transportationOptionId") == sel:
+                opt = o
+                break
+        otok = r.next_token
+        if not otok:
+            break
+    if terminal:
+        _TRANSPORT_CACHE[(pid, sid, sel)] = opt
+    return opt
 
 
 @mcp.tool()
 @tool_safe
-def get_confirmed_inbound_pickups(fcs: str = "", statuses: str = "READY_TO_SHIP",
-                                  days: int = 30) -> dict:
+async def get_confirmed_inbound_pickups(fcs: str = "", statuses: str = "READY_TO_SHIP",
+                                        days: int = 30) -> dict:
     """Carrier pickup details for confirmed inbound shipments (read-only).
 
     Walks FBA inbound plans (Fulfillment Inbound v2024-03-20, newest first,
@@ -675,91 +931,84 @@ def get_confirmed_inbound_pickups(fcs: str = "", statuses: str = "READY_TO_SHIP"
     voidable_until, cost_inr}], "plans_scanned", "pages", "skipped"}. ``skipped``
     counts plans that could not be read (AWD plans).
     """
-    from sp_api.api import FulfillmentInboundV20240320 as G
-    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
     want_st = {s.strip().upper() for s in statuses.split(",") if s.strip()}
     want_fc = {s.strip().upper() for s in fcs.split(",") if s.strip()}
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-    def _ts(v):
-        try:
-            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-        except Exception:  # noqa: BLE001
+    async def shipment(pid, sh):
+        sid = sh.get("shipmentId")
+        if not sid:
             return None
+        st = (sh.get("status") or "").upper()
+        if st and st not in want_st:
+            return None
+        full = await _io(_get_shipment, pid, sid, 5)
+        if not st:
+            st = (full.get("status") or "").upper()
+            if st not in want_st:
+                return None
+        fc = ((full.get("destination") or {}).get("warehouseId")) or ""
+        if want_fc and fc.upper() not in want_fc:
+            return None
+        sel = full.get("selectedTransportationOptionId")
+        terminal = (full.get("status") or "").upper() in _TERMINAL
+        opt = await _io(_selected_option, pid, sid, sel, terminal)
+        ap = opt.get("carrierAppointment") or {}
+        qt = opt.get("quote") or {}
+        return {
+            "plan_id": pid, "shipment_id": sid,
+            "confirmation_id": full.get("shipmentConfirmationId"),
+            "status": st, "fc": fc, "transportation_option_id": sel,
+            "carrier": (opt.get("carrier") or {}).get("alphaCode"),
+            "shipping_solution": opt.get("shippingSolution"),
+            "appt_start": ap.get("startTime"), "appt_end": ap.get("endTime"),
+            "voidable_until": qt.get("voidableUntil"),
+            "cost_inr": (qt.get("cost") or {}).get("amount"),
+        }
 
-    out, scanned, skipped, pages, token, done = [], 0, 0, 0, None, False
-    while pages < 20 and not done:
-        pages += 1
-        kw = {"pageSize": 30}
-        if token:
-            kw["paginationToken"] = token
-        else:
-            kw.update(status="ACTIVE", sortBy="CREATION_TIME", sortOrder="DESC")
-        resp = _with_retry(lambda: g.list_inbound_plans(**kw))
-        for p in ((resp.payload or {}).get("inboundPlans") or []):
-            created = _ts(p.get("createdAt"))
-            if created and created < cutoff:
-                done = True
-                break
-            pid = p.get("inboundPlanId")
-            if not pid:
-                continue
+    sem = asyncio.Semaphore(_PLAN_FANOUT)
+
+    async def read(pid):
+        async with sem:
             try:
-                det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid)).payload) or {}
+                det = await _io(_get_plan, pid, 5)
             except SellingApiException as e:
                 if getattr(e, "code", None) == 400:
-                    skipped += 1
-                    continue
+                    return None
                 raise
-            scanned += 1
-            for sh in (det.get("shipments") or []):
-                sid = sh.get("shipmentId")
-                if not sid:
+            return await asyncio.gather(*(shipment(pid, sh) for sh in det.get("shipments") or []))
+
+    tasks, pages, token, done = [], 0, None, False
+    try:
+        while pages < 20 and not done:
+            pages += 1
+            kw = {"pageSize": 30}
+            if token:
+                kw["paginationToken"] = token
+            else:
+                kw.update(status="ACTIVE", sortBy="CREATION_TIME", sortOrder="DESC")
+            resp = await _io(_list_page, kw, 5)
+            for p in ((resp.payload or {}).get("inboundPlans") or []):
+                created = _ts(p.get("createdAt"))
+                if created and created < cutoff:
+                    done = True
+                    break
+                pid = p.get("inboundPlanId")
+                if not pid:
                     continue
-                st = (sh.get("status") or "").upper()
-                if not st or st not in want_st:
-                    if st:
-                        continue
-                full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid)).payload) or {}
-                if not st:
-                    st = (full.get("status") or "").upper()
-                    if st not in want_st:
-                        continue
-                fc = ((full.get("destination") or {}).get("warehouseId")) or ""
-                if want_fc and fc.upper() not in want_fc:
-                    continue
-                sel = full.get("selectedTransportationOptionId")
-                opt, otok, op = {}, None, 0
-                while op < 10 and not opt:
-                    op += 1
-                    okw = {"inboundPlanId": pid, "shipmentId": sid}
-                    if otok:
-                        okw["paginationToken"] = otok
-                    r = _with_retry(lambda: g.list_transportation_options(**okw))
-                    for o in ((r.payload or {}).get("transportationOptions") or []):
-                        if o.get("transportationOptionId") == sel:
-                            opt = o
-                            break
-                    otok = r.next_token
-                    if not otok:
-                        break
-                ap = opt.get("carrierAppointment") or {}
-                qt = opt.get("quote") or {}
-                out.append({
-                    "plan_id": pid, "shipment_id": sid,
-                    "confirmation_id": full.get("shipmentConfirmationId"),
-                    "status": st, "fc": fc, "transportation_option_id": sel,
-                    "carrier": (opt.get("carrier") or {}).get("alphaCode"),
-                    "shipping_solution": opt.get("shippingSolution"),
-                    "appt_start": ap.get("startTime"), "appt_end": ap.get("endTime"),
-                    "voidable_until": qt.get("voidableUntil"),
-                    "cost_inr": (qt.get("cost") or {}).get("amount"),
-                })
-        token = resp.next_token
-        if not token:
-            break
-    return {"shipments": out, "plans_scanned": scanned, "pages": pages, "skipped": skipped}
+                tasks.append(asyncio.ensure_future(read(pid)))
+            token = resp.next_token
+            if not token:
+                break
+        plans = await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    out = [row for ships in plans if ships is not None for row in ships if row]
+    return {"shipments": out, "plans_scanned": sum(1 for p in plans if p is not None),
+            "pages": pages, "skipped": sum(1 for p in plans if p is None)}
 
 
 @mcp.tool()
@@ -873,85 +1122,65 @@ def search_catalog(keywords: str, page_size: int = 10, page_token: str = None,
 
 
 # --- Inbound reads, pricing, listings ----------------------------------------
-# Read-only. The inbound walks retry throttles for ~1 min (7 attempts) because a
-# planner reading every shipment has no use for a partial answer.
-
-_PATIENT = 7
 
 
-def _inbound_plan(g, pid, created_at=None):
+async def _inbound_plan(pid, created_at=None):
     """One plan with each shipment's status, confirmation id and destination FC.
 
     A shipment's status is getShipment's, else the one listed on the plan."""
-    det = (_with_retry(lambda: g.get_inbound_plan(inboundPlanId=pid),
-                       max_attempts=_PATIENT).payload) or {}
-    ships = []
-    for sh in det.get("shipments") or []:
-        sid = sh.get("shipmentId")
-        if not sid:
-            continue
-        full = (_with_retry(lambda: g.get_shipment(inboundPlanId=pid, shipmentId=sid),
-                            max_attempts=_PATIENT).payload) or {}
-        ships.append({"shipment_id": sid, "status": full.get("status") or sh.get("status"),
-                      "confirmation_id": full.get("shipmentConfirmationId"),
-                      "destination": (full.get("destination") or {}).get("warehouseId")})
+    det = await _io(_get_plan, pid, _PATIENT)
+    listed = [sh for sh in det.get("shipments") or [] if sh.get("shipmentId")]
+    fulls = await asyncio.gather(*(_io(_get_shipment, pid, sh["shipmentId"], _PATIENT)
+                                   for sh in listed))
+    ships = [{"shipment_id": sh["shipmentId"], "status": full.get("status") or sh.get("status"),
+              "confirmation_id": full.get("shipmentConfirmationId"),
+              "destination": (full.get("destination") or {}).get("warehouseId")}
+             for sh, full in zip(listed, fulls)]
     return {"plan_id": pid, "status": det.get("status"),
             "created_at": created_at or det.get("createdAt"), "shipments": ships}
 
 
 @mcp.tool()
 @tool_safe
-def get_inbound_plans(statuses: str = "ACTIVE,SHIPPED", days: int = 120,
-                      plan_ids: str = None) -> dict:
+async def get_inbound_plans(statuses: str = "ACTIVE,SHIPPED", days: int = 120,
+                            plan_ids: str = None) -> dict:
     """Inbound plans (Fulfillment Inbound v2024-03-20) with every shipment's status,
     confirmation id (FBA...) and destination FC (read-only).
 
     Lists plans for each status in ``statuses`` (comma-separated, in that order),
-    following every page, and keeps plans created in the last ``days`` days; a plan
-    listed under two statuses appears once. Or pass ``plan_ids`` (comma-separated)
-    to read just those plans, with no listing. AWD plans (GetInboundPlan answers 400)
-    are skipped and counted. Never partial: any other failure is an error.
+    newest update first, following every page until plans fall outside the window,
+    and keeps plans created in the last ``days`` days; a plan listed under two
+    statuses appears once. Or pass ``plan_ids`` (comma-separated) to read just those
+    plans, with no listing. AWD plans (GetInboundPlan answers 400) are skipped and
+    counted. Never partial: any other failure is an error.
 
     Returns {"plans": [{plan_id, status, created_at, shipments: [{shipment_id,
     status, confirmation_id, destination}]}], "pages", "skipped"}.
     """
-    from sp_api.api import FulfillmentInboundV20240320 as G
-    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
     if plan_ids:
         ids = [x.strip() for x in plan_ids.split(",") if x.strip()]
-        return {"plans": [_inbound_plan(g, pid) for pid in ids], "pages": 0, "skipped": 0}
+        sem = asyncio.Semaphore(_PLAN_FANOUT)
+
+        async def one(pid):
+            async with sem:
+                return await _inbound_plan(pid)
+
+        return {"plans": list(await asyncio.gather(*(one(pid) for pid in ids))),
+                "pages": 0, "skipped": 0}
+
+    async def read(pid, created):
+        try:
+            return await _inbound_plan(pid, created)
+        except SellingApiException as e:
+            if getattr(e, "code", None) != 400:
+                raise
+            return None  # AWD plan: GetInboundPlan does not support it
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    plans, seen, pages, skipped = [], set(), 0, 0
-    for status in [x.strip().upper() for x in statuses.split(",") if x.strip()]:
-        token, tokens = None, set()
-        while True:
-            kw = {"pageSize": 30, "status": status}
-            if token:
-                kw["paginationToken"] = token
-            resp = _with_retry(lambda: g.list_inbound_plans(**kw), max_attempts=_PATIENT)
-            pages += 1
-            for p in (resp.payload or {}).get("inboundPlans") or []:
-                pid = p.get("inboundPlanId")
-                created = p.get("createdAt")
-                if not pid or pid in seen:
-                    continue
-                if created and datetime.fromisoformat(created.replace("Z", "+00:00")) < cutoff:
-                    continue
-                seen.add(pid)
-                try:
-                    plans.append(_inbound_plan(g, pid, created))
-                except SellingApiException as e:
-                    if getattr(e, "code", None) != 400:
-                        raise
-                    skipped += 1  # AWD plan: GetInboundPlan does not support it
-            # The library hoists `pagination` off .payload; next_token reads both.
-            token = resp.next_token
-            if not token:
-                break
-            if token in tokens:
-                raise RuntimeError(f"pagination token repeated for status {status}")
-            tokens.add(token)
-    return {"plans": plans, "pages": pages, "skipped": skipped}
+    found, pages = await _walk([x.strip().upper() for x in statuses.split(",") if x.strip()],
+                               cutoff, read)
+    plans = [p for p in found if p is not None]
+    return {"plans": plans, "pages": pages, "skipped": len(found) - len(plans)}
 
 
 @mcp.tool()
@@ -968,36 +1197,7 @@ def get_inbound_shipment_items(plan_id: str, shipment_id: str,
     Returns {"items": [{msku, shipped, received}], "source": "v0" | "v2024"} and,
     after a fallback, "v0_error".
     """
-    err = "no confirmation id"
-    if confirmation_id:
-        from sp_api.api import FulfillmentInbound as V0
-        v0 = V0(credentials=creds(), marketplace=MARKETPLACE_ENUM)
-        try:
-            data = (_with_retry(lambda: v0.shipment_items_by_shipment(confirmation_id),
-                                max_attempts=_PATIENT).payload) or {}
-            return {"items": [{"msku": i["SellerSKU"], "shipped": int(i["QuantityShipped"]),
-                               "received": int(i["QuantityReceived"])}
-                              for i in data.get("ItemData") or []],
-                    "source": "v0"}
-        except Exception as e:  # noqa: BLE001 - any v0 failure falls back to v2024
-            err = f"{type(e).__name__}: {e}"[:300]
-    from sp_api.api import FulfillmentInboundV20240320 as G
-    g = G(credentials=creds(), marketplace=MARKETPLACE_ENUM)
-    items, token, tokens = [], None, set()
-    while True:
-        kw = {"inboundPlanId": plan_id, "shipmentId": shipment_id}
-        if token:
-            kw["paginationToken"] = token
-        resp = _with_retry(lambda: g.list_shipment_items(**kw), max_attempts=_PATIENT)
-        items += [{"msku": i["msku"], "shipped": int(i["quantity"]), "received": 0}
-                  for i in (resp.payload or {}).get("items") or []]
-        token = resp.next_token
-        if not token:
-            break
-        if token in tokens:
-            raise RuntimeError("pagination token repeated")
-        tokens.add(token)
-    return {"items": items, "source": "v2024", "v0_error": err}
+    return _shipment_items(plan_id, shipment_id, confirmation_id)
 
 
 @mcp.tool()
@@ -1014,7 +1214,7 @@ def get_product_pricing_for_skus(skus: str) -> dict:
     if not 1 <= len(lst) <= 20:
         raise ValueError(f"pass 1 to 20 SKUs, got {len(lst)}")
     resp = _with_retry(lambda: Products(credentials=creds(), marketplace=MARKETPLACE_ENUM)
-                       .get_product_pricing_for_skus(lst), max_attempts=_PATIENT)
+                       .get_product_pricing_for_skus(lst), max_attempts=_PATIENT, op="getPricing")
     return {"pricing": resp.payload if isinstance(resp.payload, list) else []}
 
 
