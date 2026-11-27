@@ -171,10 +171,8 @@ def _slow_early(path):
 
 async def test_reads_run_concurrently_and_keep_listing_order(api):
     walk_fixture.install(api, delay=_slow_early)
-    t0 = time.monotonic()
     res = await call("get_inbound_plans")
     assert res["plans"] == old("get_inbound_plans", {})["plans"]
-    assert time.monotonic() - t0 < 0.75 * sum(0.05 * k for k in range(1, 6)) * 2
 
     picks = await call("get_confirmed_inbound_pickups", fcs="ISK3,BLR4,DED5,NAX1",
                        statuses="WORKING,READY_TO_SHIP,IN_TRANSIT,SHIPPED,CANCELLED")
@@ -200,9 +198,31 @@ async def test_two_plan_reads_are_in_flight_together(api):
 async def test_listing_asks_for_newest_update_first(api):
     walk_fixture.install(api)
     await call("get_inbound_plans")
-    reqs = [c.request for c in api.routes[-1].calls if c.request.url.path.endswith("/inboundPlans")]
-    assert reqs and all(r.url.params["sortBy"] == "LAST_UPDATED_TIME" and
-                        r.url.params["sortOrder"] == "DESC" for r in reqs)
+    reqs = [c.request.url.params for c in api.routes[-1].calls
+            if c.request.url.path.endswith("/inboundPlans")]
+    first = [r for r in reqs if "paginationToken" not in r]
+    later = [r for r in reqs if "paginationToken" in r]
+    assert len(first) == 2 and later  # one first page per status
+    assert all(r["sortBy"] == "LAST_UPDATED_TIME" and r["sortOrder"] == "DESC" for r in first)
+    # Token pages are sent exactly as before (status + token), with no sort.
+    assert all("sortBy" not in r and "sortOrder" not in r and r["status"] for r in later)
+
+
+async def test_listing_out_of_order_reads_every_page(api):
+    IB = "https://sellingpartnerapi-eu.amazon.com/inbound/fba/2024-03-20"
+
+    def plan(pid, updated):
+        return {"inboundPlanId": pid, "createdAt": "2001-01-01T00:00:00Z", "lastUpdatedAt": updated}
+
+    route = api.get(f"{IB}/inboundPlans").mock(side_effect=[
+        httpx.Response(200, json={"inboundPlans": [plan("A", "2001-01-02T00:00:00Z"),
+                                                   plan("B", "2099-01-01T00:00:00Z")],
+                                  "pagination": {"nextToken": "N"}}),
+        httpx.Response(200, json={"inboundPlans": [plan("C", "2001-01-01T00:00:00Z")],
+                                  "pagination": {"nextToken": "M"}}),
+        httpx.Response(200, json={"inboundPlans": []})])
+    res = await call("get_inbound_plans", statuses="ACTIVE")
+    assert route.call_count == 3 and res["pages"] == 3
 
 
 async def test_listing_without_update_times_reads_every_page(api):

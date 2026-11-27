@@ -731,7 +731,8 @@ async def _walk(statuses, cutoff, read, *, max_plans=None, attempts=_PATIENT):
     A plan listed twice is read once; one created before ``cutoff`` is left out. Paging
     stops after a page holding a plan last updated before ``cutoff``: the listing is
     sorted by last update, and a plan is never updated before it was created, so every
-    later plan is outside the window too. ``read(pid, created_at)`` runs concurrently
+    later plan is outside the window too. If the update times seen so far are ever out
+    of order, that status is paged to the end instead. ``read(pid, created_at)`` runs concurrently
     (at most _PLAN_FANOUT at once) while the listing continues; returns (results in
     listing order, pages). ``statuses`` of [None] lists without a status filter.
     """
@@ -744,19 +745,25 @@ async def _walk(statuses, cutoff, read, *, max_plans=None, attempts=_PATIENT):
     tasks, seen, pages = [], set(), 0
     try:
         for status in statuses:
-            token, tokens = None, set()
+            token, tokens, last, ordered = None, set(), None, True
             while True:
-                kw = {"pageSize": 30, "sortBy": "LAST_UPDATED_TIME", "sortOrder": "DESC"}
+                kw = {"pageSize": 30}
                 if status:
                     kw["status"] = status
                 if token:
                     kw["paginationToken"] = token
+                else:  # sort on the first page only, as the pickups listing does
+                    kw.update(sortBy="LAST_UPDATED_TIME", sortOrder="DESC")
                 resp = await _io(_list_page, kw, attempts)
                 pages += 1
-                stale = False
+                stale = full = False
                 for p in (resp.payload or {}).get("inboundPlans") or []:
                     updated = _ts(p.get("lastUpdatedAt"))
-                    stale = stale or bool(updated and updated < cutoff)
+                    if updated:
+                        # Stop early only while the listing is seen to be sorted.
+                        ordered = ordered and (last is None or updated <= last)
+                        last = updated
+                        stale = stale or updated < cutoff
                     pid, created = p.get("inboundPlanId"), p.get("createdAt")
                     if not pid or pid in seen:
                         continue
@@ -764,13 +771,13 @@ async def _walk(statuses, cutoff, read, *, max_plans=None, attempts=_PATIENT):
                     if born and born < cutoff:
                         continue
                     if max_plans is not None and len(seen) >= max_plans:
-                        stale = True
+                        full = True
                         break
                     seen.add(pid)
                     tasks.append(asyncio.ensure_future(bounded(pid, created)))
                 # The library hoists `pagination` off .payload; next_token reads both.
                 token = resp.next_token
-                if not token or stale:
+                if not token or full or (stale and ordered):
                     break
                 if token in tokens:
                     raise RuntimeError(f"pagination token repeated for status {status}")
