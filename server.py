@@ -830,9 +830,10 @@ def _shipment_items(plan_id, shipment_id, confirmation_id=None):
 async def get_inbound_by_fc(statuses: str = IN_TRANSIT_STATUSES, max_plans: int = 200) -> dict:
     """Inbound units still in transit, broken down by DESTINATION fulfilment centre and SKU.
 
-    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20) created in the last
-    120 days, reads each shipment's status and destination.warehouseId, and for
-    shipments whose status is in ``statuses`` (default: transport confirmed, so
+    Walks FBA inbound plans (Fulfillment Inbound v2024-03-20) listed as ACTIVE and
+    SHIPPED (a listing with no status returns only ACTIVE, which misses un-received
+    units of SHIPPED plans) and created in the last 120 days, reads each shipment's
+    status and destination.warehouseId, and for shipments whose status is in ``statuses`` (default: transport confirmed, so
     WORKING is left out) sums shipped - received per item, floored at 0. Received
     comes from Fulfillment Inbound v0 (as get_inbound_shipment_items; without a
     confirmation id it is 0). These are fba-planner ship_agent/inbound.py's rules.
@@ -871,7 +872,7 @@ async def get_inbound_by_fc(statuses: str = IN_TRANSIT_STATUSES, max_plans: int 
             return None
         return await asyncio.gather(*(shipment(pid, sh) for sh in det.get("shipments") or []))
 
-    plans, _pages = await _walk([None], cutoff, read, max_plans=max_plans)
+    plans, _pages = await _walk(["ACTIVE", "SHIPPED"], cutoff, read, max_plans=max_plans)
     agg, by_status, nship = {}, {}, 0
     for ships in plans:
         for rec in ships or []:

@@ -52,9 +52,9 @@ def _plans():
 
 
 def _listing(status):
-    """Plans listed under ``status`` (no status: all of them, one row per plan), newest update
-    first, as the live listing returns them."""
-    rows = [p for p in PLANS if status in (None, p[1]) and (status or p[4] != "dup")]
+    """Plans listed under ``status`` (no status: ACTIVE ones only, as live Amazon does), newest
+    update first, as the live listing returns them."""
+    rows = [p for p in PLANS if p[1] == (status or "ACTIVE")]
     rows.sort(key=lambda p: p[3], reverse=True)
     return [{"inboundPlanId": pid, "createdAt": c, "lastUpdatedAt": u, "status": status}
             for pid, _, c, u, _s in rows]

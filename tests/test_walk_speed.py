@@ -309,3 +309,16 @@ async def test_by_fc_explicit_working_is_still_honoured(api):
     walk_fixture.install(api)
     res = await call("get_inbound_by_fc", statuses="WORKING")
     assert res["rows"] == [{"fc": "ISK3", "sku": "M1", "qty": 10}]
+
+
+async def test_by_fc_default_lists_active_and_shipped_plans(api):
+    # Live Amazon lists only ACTIVE plans when no status is sent; SHIPPED plans hold in-transit units.
+    calls = []
+    walk_fixture.install(api, calls=calls)
+    res = await call("get_inbound_by_fc")
+    req = [c.request for r in api.routes for c in r.calls
+           if c.request.url.path.endswith("/inboundPlans") and not c.request.url.params.get("paginationToken")]
+    assert {r.url.params.get("status") for r in req} == {"ACTIVE", "SHIPPED"}
+    rows = {(r["fc"], r["sku"]): r["qty"] for r in res["rows"]}
+    assert rows[("DED5", "M2")] == 12  # PH/SH2 IN_TRANSIT, plan listed under SHIPPED only
+    assert rows[("BLR4", "M5")] == 7  # PG/SG1 RECEIVING, plan listed under SHIPPED only
