@@ -56,7 +56,8 @@ async def test_inbound_by_fc_status_filter_skips_shipment_fetch(api):
 async def test_inbound_plans_follow_pagination(api):
     route = api.get(f"{IB}/inboundPlans").mock(side_effect=[
         ok({"inboundPlans": [{"inboundPlanId": "P1"}], "pagination": {"nextToken": "N"}}),
-        ok({"inboundPlans": [{"inboundPlanId": "P2"}]})])
+        ok({"inboundPlans": [{"inboundPlanId": "P2"}]}),
+        ok({"inboundPlans": []})])  # the SHIPPED listing
     api.get(f"{IB}/inboundPlans/P1").mock(return_value=ok({"shipments": []}))
     api.get(f"{IB}/inboundPlans/P2").mock(return_value=ok({"shipments": []}))
     res = await call("get_inbound_by_fc")
